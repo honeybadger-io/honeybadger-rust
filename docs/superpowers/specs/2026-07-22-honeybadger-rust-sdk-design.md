@@ -118,7 +118,7 @@ Everything below runs on the caller's thread, in this order:
 3. **before_notify hooks**: in registration order, each `Fn(&mut Notice) -> bool + Send + Sync`; `false` halts. Hook panics are caught (`catch_unwind`), logged, and treated as `true` (don't let one bad hook silence errors).
 4. **Ignore recheck**: hooks may have changed the class; the final class is checked against `ignore_classes` again.
 5. **Sanitize (always last, so hook-introduced data is covered)**: `filter_keys` redaction to `"[FILTERED]"` in context and breadcrumb metadata (case-insensitive key match), depth cap 20 with `"[DEPTH]"`, string truncation at 64KB **on a UTF-8 character boundary** with `"[TRUNCATED]"`. Breadcrumb metadata sanitized to depth 1.
-6. **Serialize + size cap**: the notice is serialized to bytes *before* enqueueing. Payloads over 1 MiB are dropped with a `log::warn` (the service would 413 them anyway). This bounds queue memory to `max_queue_size × 1 MiB` worst-case and keeps the worker payload-agnostic.
+6. **Serialize + size cap**: the notice is serialized to bytes *before* enqueueing. Payloads over 1 MiB are dropped with a `log::warn` (the service would 413 them anyway). This bounds queue memory to `notice_queue_size × 1 MiB` worst-case and keeps the worker payload-agnostic.
 7. **Enqueue**: `try_send` into the bounded notice channel; on full, drop + `log::warn`.
 
 `notify()` is therefore not free: symbol resolution and source reads cost milliseconds. This is documented, accepted for Phase 1 (error reporting is exceptional-path), and revisitable later with a config flag to skip enrichment or defer it — noted as future work, not built now.
@@ -230,7 +230,7 @@ Precedence: **builder > env var > default**. No config file (a Ruby-ism both new
 | `ignore_classes` | — | `[]` | exact class-string match; checked before *and* after hooks |
 | `breadcrumbs_enabled` | — | `true` | |
 | `install_panic_hook` | — | `true` | |
-| `max_queue_size` | — | `100` | notice queue; Phase 2 events get their own `events_*` options (Ruby/Elixir precedent), so this name stays notice-scoped |
+| `notice_queue_size` | — | `100` | namespaced from day one: Phase 2 events get `events_*` options (`events_queue_size`, `events_batch_size`, …), later pipelines likewise |
 | `connect_timeout` / `request_timeout` | — | 2s / 5s | |
 
 `before_notify` hooks are registered on the builder (not listed above; they are code, not data).
@@ -285,4 +285,4 @@ Material changes from the reviewed draft, for the record:
 7. **`Notice` fields private/non_exhaustive** with mutation methods; `Guard` is `#[must_use]`; init/shutdown specified as an atomic state machine with enumerated failure modes; standalone `Client` construction/transport-injection specified.
 8. **`api_key` required only for `Server` transport** (dev/test initializes without credentials); env-var reads injectable for test isolation; UTF-8-boundary truncation; source excerpts restricted to `config.root`; `environment_name` omitted when unset; `Transport` takes a request descriptor for Phase 2 compatibility.
 9. **Scope contract documented** for `context()`/`add_breadcrumb()` (current scope = global in Phase 1, request scope under later integrations) — reviewer suggested renaming to `set_global_context`; declined in favor of the documented scope contract, matching the sentry-style model and keeping the common API pleasant.
-10. Reviewer suggested renaming `max_queue_size` to `notice_queue_size`; declined — both existing clients use `max_queue_size` for the notice queue and namespace events options separately (`events_*`).
+10. Reviewer suggested renaming `max_queue_size` to `notice_queue_size`; initially declined for cross-client naming consistency, then **adopted at Ben's direction** — the Ruby/Elixir names predate Insights, and namespacing per pipeline (`notice_*`, `events_*`) is the right call when starting fresh.
