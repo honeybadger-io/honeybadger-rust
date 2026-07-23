@@ -58,7 +58,10 @@ pub(crate) fn map_frame(
 ) -> Option<Frame> {
     if let Some(name) = symbol_name {
         // Strip the trailing hash (`::h0123abcd`) before matching and reporting.
-        let clean = name.rsplit_once("::h").map(|(head, _)| head).unwrap_or(name);
+        let clean = name
+            .rsplit_once("::h")
+            .map(|(head, _)| head)
+            .unwrap_or(name);
         if INTERNAL_PREFIXES.iter().any(|p| clean.starts_with(p)) {
             return None;
         }

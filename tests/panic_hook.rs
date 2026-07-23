@@ -32,7 +32,10 @@ fn test_unwind_panic_reports_before_exit() {
         Command::new(env!("CARGO")).args(["run", "--quiet", "--example", "panic_fixture"]),
         &server.url(),
     );
-    assert!(!out.status.success(), "fixture must exit nonzero after panic");
+    assert!(
+        !out.status.success(),
+        "fixture must exit nonzero after panic"
+    );
     mock.assert();
 }
 
@@ -85,6 +88,9 @@ fn test_hook_recursion_and_chaining_do_not_abort_unwind_build() {
 
     let result = std::panic::catch_unwind(|| panic!("in-process panic"));
     assert!(result.is_err());
-    assert!(PREV_RAN.load(Ordering::SeqCst), "previous hook must still run");
+    assert!(
+        PREV_RAN.load(Ordering::SeqCst),
+        "previous hook must still run"
+    );
     drop(guard);
 }

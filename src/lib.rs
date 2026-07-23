@@ -1,4 +1,31 @@
-//! The official Honeybadger error-tracking SDK for Rust. (Docs land in the final task.)
+//! The official [Honeybadger](https://www.honeybadger.io) error-tracking SDK for Rust.
+//!
+//! # Quick start
+//!
+//! ```rust,no_run
+//! let _guard = honeybadger::init(
+//!     honeybadger::Config::builder()
+//!         .api_key("your-project-api-key") // or HONEYBADGER_API_KEY
+//!         .env("production")
+//!         .build()
+//!         .unwrap(),
+//! )
+//! .unwrap();
+//!
+//! if let Err(e) = std::fs::read_to_string("/missing") {
+//!     honeybadger::notify(&e);
+//! }
+//! // dropping `_guard` flushes pending notices and stops the worker
+//! ```
+//!
+//! Any error implementing [`std::error::Error`] can be reported; its `source()` chain
+//! becomes the Honeybadger cause list, and a backtrace is captured at the `notify`
+//! call site. Panics are reported automatically (disable with
+//! `Config::builder().install_panic_hook(false)`).
+//!
+//! The SDK never panics and never blocks your app on network I/O: `notify` enqueues to
+//! a background worker thread (bounded queue, rate-limit aware). It works in any app —
+//! tokio, async-std, or plain sync Rust — because it never touches an async runtime.
 
 mod breadcrumbs;
 mod bt;

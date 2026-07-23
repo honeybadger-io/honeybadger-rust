@@ -385,7 +385,10 @@ mod tests {
         assert_eq!(payload["server"].get("revision"), None);
         assert_eq!(payload["error"]["fingerprint"], json!(null));
         assert_eq!(payload.get("correlation_context"), None);
-        assert_eq!(payload["breadcrumbs"], json!({"enabled": true, "trail": []}));
+        assert_eq!(
+            payload["breadcrumbs"],
+            json!({"enabled": true, "trail": []})
+        );
         assert_eq!(payload["error"]["backtrace"], json!([]));
     }
 

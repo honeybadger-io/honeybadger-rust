@@ -4,9 +4,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::notice::{Notice, assemble};
 use crate::sanitizer::Sanitizer;
-use crate::transport::{
-    NullTransport, ServerTransport, Transport, TransportRequest, compress,
-};
+use crate::transport::{NullTransport, ServerTransport, Transport, TransportRequest, compress};
 use crate::worker::WorkerHandle;
 use serde_json::{Map, Value};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -299,7 +297,10 @@ mod tests {
             .root("/app")
             .hostname("h");
         let config = f(builder).build().unwrap();
-        Client::builder(config).transport(transport).build().unwrap()
+        Client::builder(config)
+            .transport(transport)
+            .build()
+            .unwrap()
     }
 
     fn delivered(transport: &TestTransport) -> Vec<serde_json::Value> {

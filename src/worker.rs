@@ -90,12 +90,7 @@ impl WorkerHandle {
         }
         // Worker acks right before exiting; bounded wait, then join (instant) or detach.
         if ack_rx.recv_timeout(timeout).is_ok() {
-            if let Some(handle) = self
-                .join
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
+            if let Some(handle) = self.join.lock().unwrap_or_else(|e| e.into_inner()).take() {
                 let _ = handle.join();
             }
         } else {
@@ -336,11 +331,7 @@ mod tests {
             w.flush(Duration::from_secs(2)),
             "flush must ack while suspended"
         );
-        assert_eq!(
-            transport.requests().len(),
-            1,
-            "no delivery while suspended"
-        );
+        assert_eq!(transport.requests().len(), 1, "no delivery while suspended");
         w.shutdown(Duration::from_secs(2)); // must return promptly despite 30s suspension
     }
 

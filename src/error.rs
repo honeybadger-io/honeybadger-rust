@@ -5,7 +5,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum Error {
-    #[error("Honeybadger is already initialized; drop the previous Guard before calling init again")]
+    #[error(
+        "Honeybadger is already initialized; drop the previous Guard before calling init again"
+    )]
     AlreadyInitialized,
 
     #[error(
