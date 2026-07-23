@@ -1,7 +1,8 @@
 //! The delivery worker: dedicated OS thread, bounded notice channel + unbounded
 //! control channel, throttle/suspend semantics (spec "Delivery architecture").
-use crate::transport::{Transport, TransportRequest};
+use crate::transport::{Transport, TransportError, TransportRequest};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -181,7 +182,10 @@ impl Worker {
 
     fn send_one(&mut self, payload: &[u8]) -> SendOutcome {
         let req = TransportRequest::notices(payload, false);
-        match self.transport.deliver(&req) {
+        // `Transport` is user-implementable: a panicking impl must not kill the worker.
+        let result = catch_unwind(AssertUnwindSafe(|| self.transport.deliver(&req)))
+            .unwrap_or_else(|_| Err(TransportError("transport panicked".into())));
+        match result {
             Ok(status) if (200..300).contains(&status) => {
                 self.throttle = self.throttle.saturating_sub(1);
                 SendOutcome::Continue
@@ -345,6 +349,45 @@ mod tests {
         w.try_enqueue(payload());
         assert!(w.flush(Duration::from_secs(10)));
         assert_eq!(transport.requests().len(), 3);
+        w.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_panicking_transport_does_not_kill_the_worker() {
+        use crate::transport::{Transport, TransportError, TransportRequest};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct PanicOnFirst {
+            calls: AtomicUsize,
+        }
+        impl Transport for PanicOnFirst {
+            fn deliver(&self, _req: &TransportRequest) -> Result<u16, TransportError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("transport blew up");
+                }
+                Ok(201)
+            }
+        }
+
+        let transport = Arc::new(PanicOnFirst {
+            calls: AtomicUsize::new(0),
+        });
+        let w = spawn(transport.clone(), 10).unwrap();
+        assert!(w.try_enqueue(payload())); // panics inside deliver
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            w.try_enqueue(payload()),
+            "worker must still accept notices after a transport panic"
+        );
+        assert!(
+            w.flush(Duration::from_secs(5)),
+            "worker must still service flush after a transport panic"
+        );
+        assert_eq!(
+            transport.calls.load(Ordering::SeqCst),
+            2,
+            "the second notice must still have been delivered"
+        );
         w.shutdown(Duration::from_secs(5));
     }
 

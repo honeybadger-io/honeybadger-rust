@@ -4,7 +4,9 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::notice::{Notice, assemble};
 use crate::sanitizer::Sanitizer;
-use crate::transport::{NullTransport, ServerTransport, Transport, TransportRequest, compress};
+use crate::transport::{
+    NullTransport, ServerTransport, Transport, TransportError, TransportRequest, compress,
+};
 use crate::worker::WorkerHandle;
 use serde_json::{Map, Value};
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -59,7 +61,11 @@ impl Client {
     pub(crate) fn deliver_now(&self, notice: Notice) {
         if let Some(payload) = self.run_pipeline(notice) {
             let req = TransportRequest::notices(&payload, true);
-            match self.0.transport.deliver(&req) {
+            // `Transport` is user-implementable: a panicking impl must not escape into
+            // the panic hook that called us.
+            let result = catch_unwind(AssertUnwindSafe(|| self.0.transport.deliver(&req)))
+                .unwrap_or_else(|_| Err(TransportError("transport panicked".into())));
+            match result {
                 Ok(status) if (200..300).contains(&status) => {}
                 Ok(status) => log::warn!("honeybadger: urgent delivery got status {status}"),
                 Err(e) => log::warn!("honeybadger: urgent delivery failed: {e}"),
@@ -438,6 +444,61 @@ mod tests {
         let reqs = transport.requests();
         assert_eq!(reqs.len(), 1);
         assert!(reqs[0].urgent);
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_api_key_required_only_for_the_server_transport() {
+        fn reporting_config_without_key() -> crate::Config {
+            crate::Config::builder()
+                .env_source(|_| None)
+                .env("production")
+                .build()
+                .unwrap()
+        }
+
+        // No key + no custom transport → ServerTransport is unbuildable.
+        match Client::new(reporting_config_without_key()) {
+            Err(Error::MissingApiKey) => {}
+            Err(e) => panic!("expected MissingApiKey, got {e}"),
+            Ok(_) => panic!("expected MissingApiKey, got a Client"),
+        }
+
+        // No key + a caller-supplied transport → fine, no credentials involved.
+        let transport = Arc::new(TestTransport::new());
+        let client = Client::builder(reporting_config_without_key())
+            .transport(transport.clone())
+            .build()
+            .expect("a custom transport needs no API key");
+        client.notify_notice(crate::Notice::message("X", "y"));
+        client.flush(Duration::from_secs(5));
+        assert_eq!(delivered(&transport).len(), 1);
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_panicking_transport_does_not_escape_the_urgent_path() {
+        struct Panicky;
+        impl crate::Transport for Panicky {
+            fn deliver(
+                &self,
+                _req: &crate::TransportRequest,
+            ) -> Result<u16, crate::TransportError> {
+                panic!("urgent transport blew up");
+            }
+        }
+        let config = crate::Config::builder()
+            .env_source(|_| None)
+            .api_key("k")
+            .env("production")
+            .build()
+            .unwrap();
+        let client = Client::builder(config)
+            .transport(Arc::new(Panicky))
+            .build()
+            .unwrap();
+        // deliver_now runs inside the panic hook; it must swallow the transport panic.
+        client.deliver_now(crate::Notice::message("panic", "argh"));
         client.shutdown(Duration::from_secs(5));
     }
 

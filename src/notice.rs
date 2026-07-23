@@ -38,7 +38,10 @@ impl Notice {
             type_name.to_owned()
         };
         let mut causes = Vec::new();
-        let mut source = error.source();
+        let mut source = catch_unwind(AssertUnwindSafe(|| error.source())).unwrap_or_else(|_| {
+            log::warn!("honeybadger: Error::source() panicked; cause chain truncated");
+            None
+        });
         while let Some(cause) = source {
             if causes.len() == MAX_CAUSES {
                 break;
@@ -48,7 +51,7 @@ impl Notice {
                 class: first_line_255(&msg),
                 message: msg,
             });
-            source = cause.source();
+            source = safe_source(cause);
         }
         Notice {
             class,
@@ -140,6 +143,16 @@ impl Notice {
             self.context.entry(k).or_insert(v);
         }
     }
+}
+
+/// `source()` is user code and may panic; a panicking link simply ends the chain.
+fn safe_source<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> Option<&'a (dyn std::error::Error + 'static)> {
+    catch_unwind(AssertUnwindSafe(|| error.source())).unwrap_or_else(|_| {
+        log::warn!("honeybadger: Error::source() panicked; cause chain truncated");
+        None
+    })
 }
 
 pub(crate) fn safe_display<E: std::fmt::Display + ?Sized>(value: &E) -> String {
@@ -301,6 +314,59 @@ mod tests {
     fn test_panicking_display_is_caught() {
         let n = Notice::from_error(&PanickyDisplay);
         assert_eq!(n.error_message(), "<panic in Display>");
+    }
+
+    #[test]
+    fn test_panicking_source_is_caught() {
+        #[derive(Debug)]
+        struct PanickySource;
+        impl fmt::Display for PanickySource {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "outer is fine")
+            }
+        }
+        impl std::error::Error for PanickySource {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                panic!("bad source")
+            }
+        }
+        // Must not unwind into the caller; the notice survives without causes.
+        let n = Notice::from_error(&PanickySource);
+        assert_eq!(n.error_message(), "outer is fine");
+        assert!(n.causes.is_empty());
+    }
+
+    #[test]
+    fn test_panicking_source_mid_chain_truncates() {
+        #[derive(Debug)]
+        struct Tail;
+        impl fmt::Display for Tail {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "tail")
+            }
+        }
+        impl std::error::Error for Tail {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                panic!("bad source deeper in the chain")
+            }
+        }
+
+        #[derive(Debug)]
+        struct Head(Tail);
+        impl fmt::Display for Head {
+            fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(f, "head")
+            }
+        }
+        impl std::error::Error for Head {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let n = Notice::from_error(&Head(Tail));
+        assert_eq!(n.causes.len(), 1);
+        assert_eq!(n.causes[0].message, "tail");
     }
 
     #[test]

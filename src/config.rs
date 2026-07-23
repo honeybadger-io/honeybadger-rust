@@ -228,9 +228,9 @@ impl ConfigBuilder {
             before_notify: self.before_notify,
         };
 
-        if config.reporting_enabled() && config.api_key.is_none() {
-            return Err(Error::MissingApiKey);
-        }
+        // The API key is NOT validated here: it is required only when the resolved
+        // transport is `Server` (spec "Config"), and the transport isn't chosen until
+        // `ClientBuilder::build` — a caller supplying their own `Transport` needs no key.
         Ok(config)
     }
 }
@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_api_key_required_only_when_reporting() {
+    fn test_api_key_not_validated_at_config_build() {
         // Excluded env: no key needed.
         let cfg = Config::builder()
             .env_source(no_env)
@@ -279,13 +279,15 @@ mod tests {
             .build()
             .unwrap();
         assert!(!cfg.reporting_enabled());
-        // Reporting env without key: error.
-        let err = Config::builder()
+        // A reporting env without a key still builds: the key is required only once
+        // the transport resolves to `Server` (see the Client tests).
+        let cfg = Config::builder()
             .env_source(no_env)
             .env("production")
             .build()
-            .unwrap_err();
-        assert!(matches!(err, crate::Error::MissingApiKey));
+            .unwrap();
+        assert!(cfg.reporting_enabled());
+        assert!(cfg.api_key.is_none());
     }
 
     #[test]
