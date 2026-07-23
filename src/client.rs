@@ -57,9 +57,14 @@ impl Client {
 
     /// Reports an error, capturing a backtrace at this call site.
     ///
-    /// Fire-and-forget: the notice is queued for the delivery thread and this returns
-    /// immediately. Every failure path — full queue, oversized payload, network error —
-    /// is reported through the `log` facade, never by panicking or blocking.
+    /// Fire-and-forget, and **no network I/O happens on your thread** — but the call is
+    /// not free. Assembly is synchronous: symbolicating the backtrace, reading source
+    /// excerpts for in-project frames, running `before_notify` hooks, serializing, and
+    /// compressing all happen here. Only delivery is handed to the background worker.
+    /// Symbolication dominates, and it is not cheap on a large binary.
+    ///
+    /// Every failure path — full queue, oversized payload, network error — is reported
+    /// through the `log` facade rather than by panicking or blocking.
     pub fn notify<E: std::error::Error + ?Sized>(&self, error: &E) {
         self.notify_notice(Notice::from_error(error));
     }
@@ -198,10 +203,16 @@ impl Client {
         Some(compress(&bytes))
     }
 
-    /// Merges key/value pairs into the client-wide context attached to every later
+    /// Merges key/value pairs into this client's context, attached to every later
     /// notice. Setting a key to [`serde_json::Value::Null`] removes it.
     ///
-    /// Notice-local context set via [`Notice::context`] wins on key collisions.
+    /// **Shared by every thread and task using this client — it is not request-scoped.**
+    /// Concurrent requests overwrite each other here, which can attribute one user's
+    /// error to another. Use it for process-wide facts; put request data on the notice
+    /// via [`Notice::context`], which travels with the notice and cannot be clobbered.
+    /// See [the crate docs](crate#context-is-process-wide).
+    ///
+    /// Notice-local context wins on key collisions.
     pub fn context<I, K>(&self, entries: I)
     where
         I: IntoIterator<Item = (K, Value)>,
@@ -218,8 +229,13 @@ impl Client {
         }
     }
 
-    /// Clears the client-wide context **and** the breadcrumb trail — the whole
-    /// accumulated diagnostic scope. Useful between requests or jobs on a reused thread.
+    /// Clears this client's context **and** its breadcrumb trail — the whole accumulated
+    /// diagnostic scope.
+    ///
+    /// The scope is shared process-wide, so this discards what every other in-flight
+    /// caller has accumulated too. It suits programs that handle one unit of work at a
+    /// time (a CLI, a cron job, a serialized queue consumer); calling it from a
+    /// concurrent request handler will erase other requests' state.
     pub fn clear_context(&self) {
         self.0
             .context
@@ -235,6 +251,10 @@ impl Client {
 
     /// Records a breadcrumb. The most recent 40 are attached to each notice; older ones
     /// fall off. A no-op when breadcrumbs are disabled in the config.
+    ///
+    /// The trail is shared process-wide, not per request: under concurrency, crumbs from
+    /// unrelated requests interleave and evict one another. Treat it as a process-level
+    /// log rather than a request timeline.
     pub fn add_breadcrumb(
         &self,
         message: &str,

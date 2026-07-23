@@ -27,8 +27,6 @@ fn main() {
     )
     .unwrap();
 
-    honeybadger::context([("user_id", serde_json::json!(123))]);
-
     if let Err(e) = do_work() {
         honeybadger::notify(&e);
     }
@@ -36,11 +34,46 @@ fn main() {
 ```
 
 - Reports any `std::error::Error` (with its `source()` chain and a backtrace).
-- Reports panics automatically.
+- Reports panics automatically, including under `panic = "abort"`.
 - Breadcrumbs, tags, fingerprints, and `before_notify` hooks are supported — see the
   [crate docs](https://docs.rs/honeybadger) and `examples/`.
-- Non-blocking: notices are delivered by a background worker with rate-limit handling.
+- No network I/O on your thread: delivery happens on a background worker with
+  rate-limit handling.
 - Runtime-agnostic: no async runtime required (or embedded).
+
+## Context
+
+Attach data to an individual error by putting it on the notice:
+
+```rust
+use serde_json::json;
+
+honeybadger::notify_notice(
+    honeybadger::Notice::from_error(&e)
+        .context([("user_id", json!(123)), ("request_id", json!(request_id))]),
+);
+```
+
+There is also `honeybadger::context(...)`, which sets context for **every** later
+notice. It is process-wide — not per request, not per thread, not per task — so in a
+concurrent server one request overwrites another's values and an error can be reported
+against the wrong user:
+
+```text
+request A:  context([("user_id", 1)])
+request B:  context([("user_id", 2)])     // overwrites A
+request A:  notify(&err)                  // reported against user 2
+```
+
+`clear_context()` has the same reach: it clears the shared process-wide state, including
+breadcrumbs, not the calling thread's.
+
+Reserve the global functions for facts that really are process-wide (release channel,
+region, worker identity) or for programs handling one unit of work at a time — a CLI, a
+cron job, a serialized consumer. Everything request-shaped belongs on the notice.
+
+Per-request scoping, where `context()` follows the current request automatically, comes
+with the planned `tracing` layer and tower/axum middleware.
 
 Configuration is env-var friendly: `HONEYBADGER_API_KEY`, `HONEYBADGER_ENV`,
 `HONEYBADGER_REVISION`, `HONEYBADGER_ROOT`, `HONEYBADGER_HOSTNAME`,

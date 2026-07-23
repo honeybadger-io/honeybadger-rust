@@ -71,7 +71,8 @@ pub trait Transport: Send + Sync {
     ///
     /// Implementations must not block indefinitely — on the urgent path the caller is a
     /// process on its way out. A panicking implementation is caught and counted as a
-    /// transport error rather than taking the worker down.
+    /// transport error rather than taking the worker down — though only in unwinding
+    /// builds; under `panic = "abort"` no `catch_unwind` in any crate can help.
     fn deliver(&self, req: &TransportRequest) -> Result<u16, TransportError>;
 }
 

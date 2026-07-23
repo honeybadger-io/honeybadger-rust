@@ -79,8 +79,15 @@ pub fn notify_notice(notice: Notice) {
     with_client(|c| c.notify_notice(notice));
 }
 
-/// Merges context into the global client. A no-op before [`init`]. See
-/// [`crate::Client::context`].
+/// Merges key/value pairs into the **process-wide** context attached to every later
+/// notice. A no-op before [`init`].
+///
+/// This store is shared by every thread and every task; it is not request-scoped. In a
+/// concurrent server, one request's values overwrite another's, and a notice can be
+/// reported against the wrong user. Use it only for process-wide facts, and put
+/// request data on the notice instead — see [the crate docs](crate#context-is-process-wide).
+///
+/// Setting a key to [`serde_json::Value::Null`] removes it.
 pub fn context<I, K>(entries: I)
 where
     I: IntoIterator<Item = (K, Value)>,
@@ -89,12 +96,21 @@ where
     with_client(|c| c.context(entries));
 }
 
-/// Clears the global client's context and breadcrumb trail. A no-op before [`init`].
+/// Clears the **process-wide** context and breadcrumb trail. A no-op before [`init`].
+///
+/// This resets state shared by the entire process, not the calling thread's or task's.
+/// Calling it from a request handler discards whatever every other in-flight request
+/// has accumulated, so it belongs between units of work in a program that handles one
+/// at a time — not in a concurrent server.
 pub fn clear_context() {
     with_client(|c| c.clear_context());
 }
 
-/// Records a breadcrumb on the global client. A no-op before [`init`].
+/// Records a breadcrumb in the **process-wide** trail. A no-op before [`init`].
+///
+/// Like [`context`], the trail is shared process-wide rather than per request: under
+/// concurrency the crumbs of unrelated requests interleave, and the 40-entry buffer
+/// evicts across all of them. Treat it as a process-level log, not a request timeline.
 pub fn add_breadcrumb(message: &str, category: &str, metadata: Option<Map<String, Value>>) {
     with_client(|c| c.add_breadcrumb(message, category, metadata));
 }

@@ -208,7 +208,8 @@ impl ConfigBuilder {
     /// (add tags, rewrite the class, attach context).
     ///
     /// A panicking hook is caught, logged, and treated as `true` — one bad hook must not
-    /// silence error reporting.
+    /// silence error reporting. (Unwinding builds only; `panic = "abort"` aborts the
+    /// process before any handler runs.)
     pub fn before_notify<F>(mut self, f: F) -> Self
     where
         F: Fn(&mut Notice) -> bool + Send + Sync + 'static,

@@ -18,7 +18,11 @@ pub enum Error {
     )]
     MissingApiKey,
 
-    /// The configured endpoint is not a usable `http://` or `https://` URL.
+    /// The configured endpoint does not begin with `http://` or `https://`.
+    ///
+    /// Only the scheme is checked. A structurally broken URL that clears that bar —
+    /// `http://` with no host, say — is accepted here and fails later at request time,
+    /// surfacing through the `log` facade as a delivery error.
     #[error("invalid Honeybadger endpoint URL: {0}")]
     InvalidEndpoint(String),
 

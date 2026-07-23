@@ -39,7 +39,9 @@ impl Notice {
     /// Because `type_name` output is not compiler-stable, override the class with
     /// [`Notice::class`] wherever you need grouping to stay fixed across releases.
     ///
-    /// A panicking `Display` or `source()` impl is caught, not propagated.
+    /// A panicking `Display` or `source()` impl is caught, not propagated — in
+    /// unwinding builds. Under `panic = "abort"` there is nothing to catch and the
+    /// process ends, which is a property of the panic strategy, not of this SDK.
     pub fn from_error<E: std::error::Error + ?Sized>(error: &E) -> Notice {
         let message = safe_display(error);
         let type_name = std::any::type_name::<E>();

@@ -17,11 +17,19 @@ fn main() {
     )
     .expect("honeybadger init");
 
-    honeybadger::context([("user_id", json!(123))]);
+    // Process-wide context: facts true of this whole process, not of one request.
+    // In a concurrent server these are shared across every thread and task, so anything
+    // request-shaped goes on the notice instead (below).
+    honeybadger::context([("region", json!("us-east-1"))]);
     honeybadger::add_breadcrumb("loading config", "app", None);
 
     if let Err(e) = load_config() {
-        honeybadger::notify(&e);
+        // Request-scoped data travels with the notice, so a concurrent request cannot
+        // overwrite it before delivery.
+        honeybadger::notify_notice(
+            honeybadger::Notice::from_error(&e)
+                .context([("user_id", json!(123)), ("request_id", json!("req-9"))]),
+        );
     }
 
     honeybadger::notify_notice(
