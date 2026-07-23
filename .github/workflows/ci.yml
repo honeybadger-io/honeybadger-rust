@@ -10,6 +10,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # Catches undefined matrix keys, bad job/step keys, and shell mistakes that a
+      # plain YAML parser accepts. Pinned: this runs an image over the repo checkout.
+      - name: Lint workflow files
+        uses: docker://rhysd/actionlint:1.7.12
+        with:
+          args: -color
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
