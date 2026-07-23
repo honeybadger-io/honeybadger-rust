@@ -29,6 +29,17 @@ pub struct Notice {
 }
 
 impl Notice {
+    /// Builds a notice from any error, capturing a backtrace at this call site.
+    ///
+    /// The `source()` chain becomes the notice's cause list (capped at five). The class
+    /// defaults to `std::any::type_name::<E>()`; for type-erased errors (`&dyn Error`,
+    /// and every link of a `source()` chain) the concrete type is unrecoverable on
+    /// stable Rust, so the class falls back to the first line of the `Display` output.
+    ///
+    /// Because `type_name` output is not compiler-stable, override the class with
+    /// [`Notice::class`] wherever you need grouping to stay fixed across releases.
+    ///
+    /// A panicking `Display` or `source()` impl is caught, not propagated.
     pub fn from_error<E: std::error::Error + ?Sized>(error: &E) -> Notice {
         let message = safe_display(error);
         let type_name = std::any::type_name::<E>();
@@ -65,6 +76,11 @@ impl Notice {
         }
     }
 
+    /// Builds a notice from a class and message, with no error value behind it.
+    ///
+    /// Unlike [`Notice::from_error`] this captures **no backtrace** — there is no error
+    /// whose origin could be attributed, and the `notify` call site is rarely where the
+    /// interesting thing happened. Honeybadger groups these by class and message.
     pub fn message(class: &str, message: &str) -> Notice {
         Notice {
             class: class.to_owned(),
@@ -79,10 +95,12 @@ impl Notice {
     }
 
     // Consuming builder methods (spec public API).
+    /// Overrides the error class, which is the primary grouping key.
     pub fn class(mut self, class: impl Into<String>) -> Self {
         self.class = class.into();
         self
     }
+    /// Appends tags to the notice.
     pub fn tags<I, S>(mut self, tags: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -91,10 +109,14 @@ impl Notice {
         self.tags.extend(tags.into_iter().map(Into::into));
         self
     }
+    /// Sets an explicit grouping fingerprint: notices sharing one collapse into a
+    /// single fault regardless of class, message, or backtrace.
     pub fn fingerprint(mut self, fp: impl Into<String>) -> Self {
         self.fingerprint = Some(fp.into());
         self
     }
+    /// Merges key/value context into the notice. Notice-local keys win over any set on
+    /// the client via [`crate::context`].
     pub fn context<I, K>(mut self, entries: I) -> Self
     where
         I: IntoIterator<Item = (K, Value)>,
@@ -107,32 +129,43 @@ impl Notice {
     }
 
     // Hook-facing mutators.
+    /// Replaces the error class. Intended for `before_notify` hooks.
     pub fn set_class(&mut self, class: impl Into<String>) {
         self.class = class.into();
     }
+    /// Replaces the error message. Intended for `before_notify` hooks.
     pub fn set_message(&mut self, message: impl Into<String>) {
         self.message = message.into();
     }
+    /// Sets or clears the grouping fingerprint. Intended for `before_notify` hooks.
     pub fn set_fingerprint(&mut self, fp: Option<String>) {
         self.fingerprint = fp;
     }
+    /// Appends one tag. Intended for `before_notify` hooks.
     pub fn add_tag(&mut self, tag: impl Into<String>) {
         self.tags.push(tag.into());
     }
+    /// Sets one context key. Intended for `before_notify` hooks. Values land in the
+    /// notice before sanitization, so filtered keys are still redacted.
     pub fn set_context(&mut self, key: impl Into<String>, value: impl Into<Value>) {
         self.context.insert(key.into(), value.into());
     }
 
     // Read accessors.
+    /// The current error class.
     pub fn error_class(&self) -> &str {
         &self.class
     }
+    /// The current error message.
     pub fn error_message(&self) -> &str {
         &self.message
     }
+    /// The notice-local context accumulated so far. Client-scope context is merged in
+    /// later, during delivery, so it does not appear here.
     pub fn get_context(&self) -> &Map<String, Value> {
         &self.context
     }
+    /// The tags set so far.
     pub fn get_tags(&self) -> &[String] {
         &self.tags
     }

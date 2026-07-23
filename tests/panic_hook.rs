@@ -41,6 +41,18 @@ fn test_unwind_panic_reports_before_exit() {
 
 #[test]
 fn test_abort_panic_reports_before_exit() {
+    // `cargo package` strips tests/fixtures/abort_fixture: it carries its own Cargo.toml,
+    // so cargo treats it as a separate package and leaves it out of the .crate archive.
+    // Skip rather than fail when running against packaged sources.
+    let manifest = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/abort_fixture/Cargo.toml"
+    );
+    if !std::path::Path::new(manifest).exists() {
+        eprintln!("skipping: abort fixture absent (packaged sources)");
+        return;
+    }
+
     let mut server = mockito::Server::new();
     let mock = server
         .mock("POST", "/v1/notices")
@@ -55,10 +67,6 @@ fn test_abort_panic_reports_before_exit() {
         .expect(1)
         .create();
 
-    let manifest = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/abort_fixture/Cargo.toml"
-    );
     let out = spawn_fixture(
         Command::new(env!("CARGO")).args(["run", "--quiet", "--manifest-path", manifest]),
         &server.url(),

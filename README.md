@@ -7,7 +7,12 @@ The official [Honeybadger](https://www.honeybadger.io) error-tracking SDK for Ru
 ```toml
 [dependencies]
 honeybadger = "0.1"
+serde_json = "1"  # context values are serde_json::Value
 ```
+
+`serde_json` is a direct dependency for you too: context values are `serde_json::Value`,
+so calling `honeybadger::context([("user_id", json!(123))])` needs the `json!` macro in
+your own `Cargo.toml`.
 
 ## Usage
 

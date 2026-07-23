@@ -67,7 +67,7 @@ Surface (all free functions delegate to the global `Client`; every one exists as
 | `init(config) -> Result<Guard, Error>` | See init/shutdown lifecycle below. `Guard` is `#[must_use]` (diagnostic: dropping it immediately shuts reporting down). |
 | `notify<E: std::error::Error + ?Sized>(&E)` | Builds a notice (backtrace captured here), runs the pipeline, enqueues. Fire-and-forget: returns `()`; failures surface via the `log` facade. `?Sized` so `&dyn Error` works; for erased types the class falls back to the Display output (see Payload). |
 | `notify_notice(Notice)` | Same pipeline for a hand-built notice. `Notice::message(class, msg)` covers no-error-value reporting; `Notice::from_error(&e)` is the builder entry (backtrace captured at this call). |
-| `context(iter)` / `clear_context()` | Merge into / clear the **current scope's** context (`serde_json::Value` values). Setting a key to `Value::Null` removes it (Elixir convention). |
+| `context(iter)` / `clear_context()` | Merge into / clear the **current scope's** context (`serde_json::Value` values). Setting a key to `Value::Null` removes it (Elixir convention). `clear_context()` clears the breadcrumb trail as well — it resets the whole accumulated diagnostic scope, matching Ruby's `Honeybadger.clear!`. |
 | `add_breadcrumb(message, category, metadata)` | Push onto the current scope's 40-entry ring buffer. No-op when breadcrumbs disabled. |
 | `flush(timeout) -> bool` | Block until every notice **enqueued before this call** is delivered (or dropped), or timeout. Returns whether the barrier was reached. Defined as all-pipeline from day one (Phase 2 events flush under the same call). |
 
@@ -118,7 +118,7 @@ Everything below runs on the caller's thread, in this order:
 3. **before_notify hooks**: in registration order, each `Fn(&mut Notice) -> bool + Send + Sync`; `false` halts. Hook panics are caught (`catch_unwind`), logged, and treated as `true` (don't let one bad hook silence errors).
 4. **Ignore recheck**: hooks may have changed the class; the final class is checked against `ignore_classes` again.
 5. **Sanitize (always last, so hook-introduced data is covered)**: `filter_keys` redaction to `"[FILTERED]"` in context and breadcrumb metadata (case-insensitive key match), depth cap 20 with `"[DEPTH]"`, string truncation at 64KB **on a UTF-8 character boundary** with `"[TRUNCATED]"`. Breadcrumb metadata sanitized to depth 1.
-6. **Serialize + size cap**: the notice is serialized to bytes *before* enqueueing. Payloads over 1 MiB are dropped with a `log::warn` (the service would 413 them anyway). This bounds queue memory to `notice_queue_size × 1 MiB` worst-case and keeps the worker payload-agnostic.
+6. **Serialize + size cap**: the notice is serialized to bytes *before* enqueueing. Payloads whose serialized JSON exceeds **262,144 bytes** — the Reporting API's documented maximum — are dropped with a `log::warn` rather than sent to be 413'd. The cap is applied pre-compression because that is what the service measures. This bounds queue memory to `notice_queue_size × 256 KiB` worst-case and keeps the worker payload-agnostic.
 7. **Enqueue**: `try_send` into the bounded notice channel; on full, drop + `log::warn`.
 
 `notify()` is therefore not free: symbol resolution and source reads cost milliseconds. This is documented, accepted for Phase 1 (error reporting is exceptional-path), and revisitable later with a config flag to skip enrichment or defer it — noted as future work, not built now.
@@ -278,7 +278,7 @@ Material changes from the reviewed draft, for the record:
 
 1. **Panic hook redesigned as a permanent dispatcher** with client registration/deregistration — never uninstalled, fixing the Drop-during-unwind double-panic and the clobbering of later-installed hooks. Recursion guard + `catch_unwind` throughout; **panic notices bypass the queue** and deliver synchronously with short timeouts (the queued path could drop or delay them, making the delivery guarantee false).
 2. **Sanitization moved after before_notify hooks** (hooks could reintroduce secrets past an earlier sanitization pass); `ignore_classes` rechecked after hooks.
-3. **Serialize-before-enqueue with a 1 MiB payload cap**, bounding queue memory.
+3. **Serialize-before-enqueue with a 256 KiB payload cap** (the service's documented maximum), bounding queue memory.
 4. **Separate control channel** (flush/shutdown) so a full notice queue can't block control; all worker waits are interruptible; throttle arithmetic saturated; suspended-state behavior fully specified.
 5. **Flush defined as a happens-before barrier**, not global emptiness; all-pipeline from day one.
 6. **`type_name` instability acknowledged**; class is caller-overridable; erased-type and cause class fallback rules specified. `notify` takes `E: Error + ?Sized`.

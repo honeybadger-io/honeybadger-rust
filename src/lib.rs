@@ -27,6 +27,8 @@
 //! a background worker thread (bounded queue, rate-limit aware). It works in any app —
 //! tokio, async-std, or plain sync Rust — because it never touches an async runtime.
 
+#![warn(missing_docs)]
+
 mod breadcrumbs;
 mod bt;
 mod client;

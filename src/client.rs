@@ -13,7 +13,9 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub(crate) const MAX_PAYLOAD_BYTES: usize = 1_048_576;
+/// Serialized-JSON ceiling, matching the Reporting API's documented maximum. Measured
+/// before compression: the service applies the limit to the decompressed body.
+pub(crate) const MAX_PAYLOAD_BYTES: usize = 262_144;
 
 struct Inner {
     config: Config,
@@ -28,16 +30,24 @@ struct Inner {
 #[derive(Clone)]
 pub struct Client(Arc<Inner>);
 
+/// Builder for [`Client`], used to supply a custom [`Transport`].
 pub struct ClientBuilder {
     config: Config,
     transport: Option<Arc<dyn Transport>>,
 }
 
 impl Client {
+    /// Builds a client and starts its delivery thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingApiKey`] when reporting is enabled but no key was configured, and
+    /// [`Error::WorkerSpawn`] if the delivery thread cannot start.
     pub fn new(config: Config) -> Result<Client, Error> {
         Client::builder(config).build()
     }
 
+    /// Starts a builder, for injecting a custom [`Transport`].
     pub fn builder(config: Config) -> ClientBuilder {
         ClientBuilder {
             config,
@@ -45,10 +55,17 @@ impl Client {
         }
     }
 
+    /// Reports an error, capturing a backtrace at this call site.
+    ///
+    /// Fire-and-forget: the notice is queued for the delivery thread and this returns
+    /// immediately. Every failure path — full queue, oversized payload, network error —
+    /// is reported through the `log` facade, never by panicking or blocking.
     pub fn notify<E: std::error::Error + ?Sized>(&self, error: &E) {
         self.notify_notice(Notice::from_error(error));
     }
 
+    /// Reports a notice built by hand. See [`Notice::from_error`] and
+    /// [`Notice::message`].
     pub fn notify_notice(&self, notice: Notice) {
         if let Some(payload) = self.run_pipeline(notice) {
             if !self.0.worker.try_enqueue(payload) {
@@ -173,7 +190,7 @@ impl Client {
         };
         if bytes.len() > MAX_PAYLOAD_BYTES {
             log::warn!(
-                "honeybadger: notice payload {} bytes exceeds 1 MiB cap; dropped",
+                "honeybadger: notice payload {} bytes exceeds the {MAX_PAYLOAD_BYTES}-byte cap; dropped",
                 bytes.len()
             );
             return None;
@@ -181,6 +198,10 @@ impl Client {
         Some(compress(&bytes))
     }
 
+    /// Merges key/value pairs into the client-wide context attached to every later
+    /// notice. Setting a key to [`serde_json::Value::Null`] removes it.
+    ///
+    /// Notice-local context set via [`Notice::context`] wins on key collisions.
     pub fn context<I, K>(&self, entries: I)
     where
         I: IntoIterator<Item = (K, Value)>,
@@ -197,6 +218,8 @@ impl Client {
         }
     }
 
+    /// Clears the client-wide context **and** the breadcrumb trail — the whole
+    /// accumulated diagnostic scope. Useful between requests or jobs on a reused thread.
     pub fn clear_context(&self) {
         self.0
             .context
@@ -210,6 +233,8 @@ impl Client {
             .clear();
     }
 
+    /// Records a breadcrumb. The most recent 40 are attached to each notice; older ones
+    /// fall off. A no-op when breadcrumbs are disabled in the config.
     pub fn add_breadcrumb(
         &self,
         message: &str,
@@ -226,10 +251,14 @@ impl Client {
             .push(Breadcrumb::new(message, category, metadata));
     }
 
+    /// Blocks until every notice queued so far has been attempted, or `timeout` expires.
+    /// Returns whether the barrier completed in time.
     pub fn flush(&self, timeout: Duration) -> bool {
         self.0.worker.flush(timeout)
     }
 
+    /// Stops the delivery thread, giving queued notices up to `timeout` to drain. The
+    /// client accepts no further notices afterwards.
     pub fn shutdown(&self, timeout: Duration) {
         self.0.worker.shutdown(timeout);
     }
@@ -240,11 +269,19 @@ impl Client {
 }
 
 impl ClientBuilder {
+    /// Supplies the transport, replacing the one that would be chosen from the config.
+    /// A client built this way needs no API key.
     pub fn transport(mut self, transport: Arc<dyn Transport>) -> Self {
         self.transport = Some(transport);
         self
     }
 
+    /// Resolves the transport and starts the delivery thread.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::MissingApiKey`] if reporting is enabled, no transport was supplied, and
+    /// no API key is configured; [`Error::WorkerSpawn`] if the thread cannot start.
     pub fn build(self) -> Result<Client, Error> {
         let config = self.config;
         let transport: Arc<dyn Transport> = match self.transport {
@@ -422,7 +459,7 @@ mod tests {
         // The sanitizer truncates individual strings at 64 KB, so build the oversize
         // payload from many keys instead of one giant string.
         let mut notice = crate::Notice::message("Big", "b");
-        for i in 0..40 {
+        for i in 0..10 {
             notice.set_context(format!("k{i}"), json!("y".repeat(60_000)));
         }
         client.notify_notice(notice);
@@ -432,6 +469,14 @@ mod tests {
             0,
             "oversized payload must be dropped"
         );
+
+        // A payload comfortably under the cap still goes out: the check is a ceiling,
+        // not a blanket rejection of large-ish context.
+        let mut notice = crate::Notice::message("Chunky", "b");
+        notice.set_context("k", json!("y".repeat(60_000)));
+        client.notify_notice(notice);
+        client.flush(Duration::from_secs(5));
+        assert_eq!(delivered(&transport).len(), 1);
         client.shutdown(Duration::from_secs(5));
     }
 

@@ -11,20 +11,28 @@ pub(crate) const NOTICES_PATH: &str = "/v1/notices";
 #[non_exhaustive]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RequestKind {
+    /// The error-reporting API, `POST /v1/notices`.
     Notices,
 }
 
 /// One outbound request. Construct via [`TransportRequest::notices`].
 #[non_exhaustive]
 pub struct TransportRequest<'a> {
+    /// Which API this request targets.
     pub kind: RequestKind,
+    /// Path to append to the configured endpoint.
     pub path: &'a str,
+    /// MIME type of the body, before compression.
     pub content_type: &'a str,
+    /// Request body, already zlib-deflated. Send it with `Content-Encoding: deflate`.
     pub body: &'a [u8],
+    /// Set for panic notices, delivered synchronously while the process is dying. Use
+    /// short timeouts and don't retry.
     pub urgent: bool,
 }
 
 impl<'a> TransportRequest<'a> {
+    /// Builds a request against the notices API.
     pub fn notices(body: &'a [u8], urgent: bool) -> Self {
         TransportRequest {
             kind: RequestKind::Notices,
@@ -36,8 +44,14 @@ impl<'a> TransportRequest<'a> {
     }
 }
 
+/// A delivery failure: connection refused, timeout, TLS error, or a panicking
+/// [`Transport`] impl. A non-2xx *response* is not an error — it comes back as
+/// `Ok(status)` so the worker can pick the right backoff.
 #[derive(Debug)]
-pub struct TransportError(pub String);
+pub struct TransportError(
+    /// Human-readable description of what went wrong.
+    pub String,
+);
 
 impl std::fmt::Display for TransportError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,6 +62,16 @@ impl std::error::Error for TransportError {}
 
 /// The delivery seam. Implement this to intercept or fake HTTP delivery.
 pub trait Transport: Send + Sync {
+    /// Delivers one request, returning the HTTP status.
+    ///
+    /// Return `Ok(status)` for *any* response the server produced, including 4xx and
+    /// 5xx: the worker reads 402/403 as "suspend", 429/503 as "throttle", and anything
+    /// else unexpected as a dropped notice. Reserve `Err` for requests that never got a
+    /// response at all.
+    ///
+    /// Implementations must not block indefinitely — on the urgent path the caller is a
+    /// process on its way out. A panicking implementation is caught and counted as a
+    /// transport error rather than taking the worker down.
     fn deliver(&self, req: &TransportRequest) -> Result<u16, TransportError>;
 }
 
@@ -140,9 +164,13 @@ impl Transport for NullTransport {
 
 /// A request captured by [`TestTransport`].
 pub struct CapturedRequest {
+    /// Path the request was sent to.
     pub path: String,
+    /// Content type of the body.
     pub content_type: String,
+    /// The compressed body as delivered; inflate it to inspect the JSON.
     pub body: Vec<u8>,
+    /// Whether the request took the urgent (panic) path.
     pub urgent: bool,
 }
 
@@ -154,6 +182,7 @@ pub struct TestTransport {
 }
 
 impl TestTransport {
+    /// Creates an empty test transport.
     pub fn new() -> Self {
         TestTransport::default()
     }
@@ -166,6 +195,7 @@ impl TestTransport {
             .push(status);
     }
 
+    /// Snapshot of every request delivered so far, oldest first.
     pub fn requests(&self) -> Vec<CapturedRequest> {
         let lock = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         lock.iter()

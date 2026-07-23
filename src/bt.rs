@@ -69,7 +69,9 @@ pub(crate) fn map_frame(
             .map(|f| f.starts_with(root) && !root.is_empty())
             .unwrap_or(false);
         let source = match (in_root, file, line) {
-            (true, Some(f), Some(n)) => read_excerpt(f, n),
+            // Lexical containment decides the display path, but reading a file needs the
+            // stronger check: a symlink under the root can resolve outside it.
+            (true, Some(f), Some(n)) if resolves_under_root(f, root) => read_excerpt(f, n),
             _ => None,
         };
         let file_str = file.map(|f| {
@@ -94,6 +96,19 @@ pub(crate) fn map_frame(
         method: None,
         source: None,
     })
+}
+
+/// Symlink-aware containment: both sides are canonicalized before comparison, so a link
+/// living under `root` but pointing elsewhere cannot smuggle an out-of-tree file into a
+/// notice. Only called for frames we are about to read, since it costs two `stat` walks.
+///
+/// If either path cannot be canonicalized (missing source on a deployed binary, for
+/// instance) we report no containment — `read_excerpt` would fail on that path anyway.
+fn resolves_under_root(file: &Path, root: &str) -> bool {
+    match (std::fs::canonicalize(file), std::fs::canonicalize(root)) {
+        (Ok(file), Ok(root)) => file.starts_with(root),
+        _ => false,
+    }
 }
 
 fn read_excerpt(file: &Path, lineno: u32) -> Option<BTreeMap<String, String>> {
@@ -167,6 +182,48 @@ mod tests {
         let source = f.source.expect("source excerpt expected for in-root file");
         assert!(source.contains_key("3"));
         assert!(source.len() <= 5); // lineno ± 2
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_symlink_out_of_root_yields_no_source_excerpt() {
+        use std::io::Write;
+
+        // A "project" whose src/leak.rs is a symlink to a file outside the project.
+        let base = std::env::temp_dir().join(format!("hb-symlink-test-{}", std::process::id()));
+        let root = base.join("project");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let secret = outside.join("secret.rs");
+        let mut f = std::fs::File::create(&secret).unwrap();
+        writeln!(f, "const TOKEN: &str = \"do-not-leak\";").unwrap();
+        writeln!(f, "// line two").unwrap();
+        writeln!(f, "// line three").unwrap();
+        drop(f);
+
+        let link = root.join("src/leak.rs");
+        let _ = std::fs::remove_file(&link);
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+
+        let root_str = root.to_string_lossy().into_owned();
+        let frame = map_frame(Some("my_app::leak"), Some(&link), Some(2), &root_str).unwrap();
+
+        assert!(
+            frame.source.is_none(),
+            "a symlink resolving outside the project root must not be excerpted"
+        );
+        // The path is still reported (and still root-substituted) — only reading is refused.
+        assert_eq!(frame.file.as_deref(), Some("[PROJECT_ROOT]/src/leak.rs"));
+
+        // A real file under the root is still excerpted.
+        let honest = root.join("src/honest.rs");
+        std::fs::write(&honest, "fn a() {}\nfn b() {}\nfn c() {}\n").unwrap();
+        let frame = map_frame(Some("my_app::honest"), Some(&honest), Some(2), &root_str).unwrap();
+        assert!(frame.source.is_some(), "in-root files are still excerpted");
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

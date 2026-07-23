@@ -15,6 +15,11 @@ pub struct Breadcrumb {
 }
 
 impl Breadcrumb {
+    /// Builds a breadcrumb stamped with the current UTC time.
+    ///
+    /// `category` groups related crumbs in the Honeybadger UI (`"query"`, `"ui"`,
+    /// `"custom"`, …). `metadata` is sanitized one level deep before delivery: nested
+    /// objects and arrays are replaced with `"[DEPTH]"`, so keep it flat.
     pub fn new(message: &str, category: &str, metadata: Option<Map<String, Value>>) -> Self {
         Self::with_timestamp(message, category, metadata, now_iso8601_ms())
     }

@@ -8,6 +8,10 @@ use std::time::Duration;
 pub type BeforeNotifyHook = dyn Fn(&mut Notice) -> bool + Send + Sync;
 type EnvSource = Box<dyn Fn(&str) -> Option<String>>;
 
+/// Resolved SDK configuration. Build one with [`Config::builder`].
+///
+/// Every field follows the same precedence: an explicit builder call wins, then the
+/// matching `HONEYBADGER_*` environment variable, then the default.
 pub struct Config {
     pub(crate) api_key: Option<String>,
     pub(crate) env: Option<String>,
@@ -28,6 +32,7 @@ pub struct Config {
 }
 
 impl Config {
+    /// Starts a new configuration builder.
     pub fn builder() -> ConfigBuilder {
         ConfigBuilder::default()
     }
@@ -57,6 +62,8 @@ impl std::fmt::Debug for Config {
     }
 }
 
+/// Builder for [`Config`]. Every setter is optional; see each one for its default and
+/// its environment-variable fallback.
 pub struct ConfigBuilder {
     api_key: Option<String>,
     env: Option<String>,
@@ -102,66 +109,106 @@ impl Default for ConfigBuilder {
 }
 
 impl ConfigBuilder {
+    /// Project API key. Env: `HONEYBADGER_API_KEY`. Required only when notices are
+    /// actually sent to the Honeybadger service — an excluded environment, or a
+    /// caller-supplied [`crate::Transport`], needs no key.
     pub fn api_key(mut self, v: impl Into<String>) -> Self {
         self.api_key = Some(v.into());
         self
     }
+    /// Environment name reported with each notice, e.g. `"production"`. Env:
+    /// `HONEYBADGER_ENV`. Also drives [`ConfigBuilder::exclude_envs`].
     pub fn env(mut self, v: impl Into<String>) -> Self {
         self.env = Some(v.into());
         self
     }
+    /// Environments that do not report. Default: `["development", "test"]`. In an
+    /// excluded environment the SDK initializes and accepts notices but discards them.
     pub fn exclude_envs<I: IntoIterator<Item = S>, S: Into<String>>(mut self, v: I) -> Self {
         self.exclude_envs = Some(v.into_iter().map(Into::into).collect());
         self
     }
+    /// Forces reporting on or off, overriding the [`ConfigBuilder::exclude_envs`]
+    /// decision in both directions. Env: `HONEYBADGER_ENABLED` (`true`/`1`/`yes`).
     pub fn enabled(mut self, v: bool) -> Self {
         self.enabled = Some(v);
         self
     }
+    /// Base URL of the Honeybadger API. Default: `https://api.honeybadger.io`. Env:
+    /// `HONEYBADGER_ENDPOINT`. Set this for the EU region, a proxy, or a test server.
     pub fn endpoint(mut self, v: impl Into<String>) -> Self {
         self.endpoint = Some(v.into());
         self
     }
+    /// Project root. Paths beneath it are reported as `[PROJECT_ROOT]/…`, and only
+    /// files under it get source excerpts. Default: the current directory. Env:
+    /// `HONEYBADGER_ROOT`.
     pub fn root(mut self, v: impl Into<String>) -> Self {
         self.root = Some(v.into());
         self
     }
+    /// Hostname reported with each notice. Default: the system hostname. Env:
+    /// `HONEYBADGER_HOSTNAME`.
     pub fn hostname(mut self, v: impl Into<String>) -> Self {
         self.hostname = Some(v.into());
         self
     }
+    /// Deploy revision (commit SHA) used to attribute errors to a release. Env:
+    /// `HONEYBADGER_REVISION`.
     pub fn revision(mut self, v: impl Into<String>) -> Self {
         self.revision = Some(v.into());
         self
     }
+    /// Keys whose values are replaced with `"[FILTERED]"` in context and breadcrumb
+    /// metadata, matched case-insensitively. Default:
+    /// `["password", "credit_card", "secret"]`. Filtering runs last, so it also covers
+    /// data added by [`ConfigBuilder::before_notify`] hooks.
     pub fn filter_keys<I: IntoIterator<Item = S>, S: Into<String>>(mut self, v: I) -> Self {
         self.filter_keys = Some(v.into_iter().map(Into::into).collect());
         self
     }
+    /// Error classes to drop without reporting, matched exactly against
+    /// [`crate::Notice::error_class`]. Checked both before and after hooks run.
     pub fn ignore_classes<I: IntoIterator<Item = S>, S: Into<String>>(mut self, v: I) -> Self {
         self.ignore_classes = Some(v.into_iter().map(Into::into).collect());
         self
     }
+    /// Whether breadcrumbs are collected and attached to notices. Default: `true`.
+    /// When `false`, [`crate::add_breadcrumb`] becomes a no-op.
     pub fn breadcrumbs_enabled(mut self, v: bool) -> Self {
         self.breadcrumbs_enabled = Some(v);
         self
     }
+    /// Whether [`crate::init`] reports panics. Default: `true`. The dispatcher chains
+    /// to whatever hook was already installed, so existing panic handling still runs.
     pub fn install_panic_hook(mut self, v: bool) -> Self {
         self.install_panic_hook = Some(v);
         self
     }
+    /// Capacity of the queue feeding the delivery thread. Default: `100`. Notices
+    /// offered to a full queue are dropped with a `log::warn` rather than blocking the
+    /// caller.
     pub fn notice_queue_size(mut self, v: usize) -> Self {
         self.notice_queue_size = Some(v);
         self
     }
+    /// TCP connect timeout for delivery. Default: 2s. (Panic notices use a fixed,
+    /// shorter timeout: the process is already on its way out.)
     pub fn connect_timeout(mut self, v: Duration) -> Self {
         self.connect_timeout = Some(v);
         self
     }
+    /// Total timeout for one delivery request. Default: 5s.
     pub fn request_timeout(mut self, v: Duration) -> Self {
         self.request_timeout = Some(v);
         self
     }
+    /// Registers a hook run against every notice just before delivery, in registration
+    /// order. Returning `false` drops the notice. Hooks may mutate the notice freely
+    /// (add tags, rewrite the class, attach context).
+    ///
+    /// A panicking hook is caught, logged, and treated as `true` — one bad hook must not
+    /// silence error reporting.
     pub fn before_notify<F>(mut self, f: F) -> Self
     where
         F: Fn(&mut Notice) -> bool + Send + Sync + 'static,
@@ -175,6 +222,13 @@ impl ConfigBuilder {
         self
     }
 
+    /// Resolves builder values, environment variables, and defaults into a [`Config`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidEndpoint`] if the endpoint is not an `http://` or `https://` URL.
+    /// The API key is *not* checked here — that happens when the transport is resolved
+    /// in [`crate::Client::new`].
     pub fn build(self) -> Result<Config, Error> {
         let ev = |key: &str| (self.env_source)(key);
         let parse_bool = |s: String| matches!(s.as_str(), "true" | "1" | "yes");
