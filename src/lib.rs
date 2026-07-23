@@ -10,3 +10,4 @@ mod sanitizer;
 pub use crate::breadcrumbs::Breadcrumb;
 pub use crate::config::{Config, ConfigBuilder};
 pub use crate::error::Error;
+pub use crate::notice::Notice;
