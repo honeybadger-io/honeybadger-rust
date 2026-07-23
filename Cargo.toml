@@ -1,0 +1,26 @@
+[package]
+name = "honeybadger"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "The official Honeybadger error-tracking SDK for Rust"
+license = "MIT"
+repository = "https://github.com/honeybadger-io/honeybadger-rust"
+readme = "README.md"
+categories = ["development-tools::debugging", "web-programming"]
+keywords = ["honeybadger", "error", "monitoring", "exception"]
+
+[dependencies]
+backtrace = "0.3"
+crossbeam-channel = "0.5"
+flate2 = "1"
+hostname = "0.4"
+jiff = "0.2"
+log = "0.4"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
+
+[dev-dependencies]
+mockito = "1"
