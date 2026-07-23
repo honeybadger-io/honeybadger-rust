@@ -31,6 +31,10 @@ pub(crate) struct Frame {
 
 pub(crate) fn capture(root: &str) -> Vec<Frame> {
     let bt = backtrace::Backtrace::new(); // captures + resolves symbols
+    process_resolved(&bt, root)
+}
+
+pub(crate) fn process_resolved(bt: &backtrace::Backtrace, root: &str) -> Vec<Frame> {
     let mut frames = Vec::new();
     for frame in bt.frames() {
         for symbol in frame.symbols() {
