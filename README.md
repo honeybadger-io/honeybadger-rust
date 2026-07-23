@@ -6,7 +6,7 @@ The official [Honeybadger](https://www.honeybadger.io) error-tracking SDK for Ru
 
 ```toml
 [dependencies]
-honeybadger = "0.1"
+honeybadger = "0.5"
 serde_json = "1"  # context values are serde_json::Value
 ```
 
