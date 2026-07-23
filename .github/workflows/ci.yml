@@ -1,5 +1,14 @@
 name: CI
 
+# Third-party actions are pinned by immutable digest, never by tag or branch: a tag can
+# be moved and a branch tip always moves, so either would let upstream change what runs
+# against this checkout without a commit here. The trailing comment records the human
+# version each digest corresponds to — update both together.
+#
+# dtolnay/rust-toolchain is pinned to `master` rather than its `stable` / `1.85`
+# branches, because those branches select the toolchain by their *name*. Pinning them
+# would freeze the name away, so the toolchain moves to an explicit `toolchain:` input.
+
 on:
   push:
     branches: [main]
@@ -9,15 +18,16 @@ jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Catches undefined matrix keys, bad job/step keys, and shell mistakes that a
-      # plain YAML parser accepts. Pinned: this runs an image over the repo checkout.
+      # plain YAML parser accepts.
       - name: Lint workflow files
-        uses: docker://rhysd/actionlint:1.7.12
+        uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:
           args: -color
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
         with:
+          toolchain: stable
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
@@ -34,8 +44,10 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          toolchain: stable
       - run: cargo build --examples
       # The panic-hook tests spawn fixture processes via nested `cargo run`, so this
       # job compiles the crate three times over; it is slower than it looks.
@@ -44,6 +56,9 @@ jobs:
   msrv:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master
+        with:
+          # Quoted: bare 1.85 is a YAML float, and a future 1.90 would arrive as "1.9".
+          toolchain: "1.85"
       - run: cargo check --all-targets
