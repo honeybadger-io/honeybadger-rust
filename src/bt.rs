@@ -65,26 +65,16 @@ pub(crate) fn map_frame(
         if INTERNAL_PREFIXES.iter().any(|p| clean.starts_with(p)) {
             return None;
         }
-        let in_root = file
-            .map(|f| f.starts_with(root) && !root.is_empty())
-            .unwrap_or(false);
+        let in_root = file.map(|f| lexically_under_root(f, root)).unwrap_or(false);
         let source = match (in_root, file, line) {
             // Lexical containment decides the display path, but reading a file needs the
             // stronger check: a symlink under the root can resolve outside it.
             (true, Some(f), Some(n)) if resolves_under_root(f, root) => read_excerpt(f, n),
             _ => None,
         };
-        let file_str = file.map(|f| {
-            let s = f.to_string_lossy().into_owned();
-            if in_root {
-                s.replacen(root, PROJECT_ROOT, 1)
-            } else {
-                s
-            }
-        });
         return Some(Frame {
             number: line,
-            file: file_str,
+            file: file.map(|f| display_path(f, root)),
             method: Some(clean.to_owned()),
             source,
         });
@@ -96,6 +86,40 @@ pub(crate) fn map_frame(
         method: None,
         source: None,
     })
+}
+
+/// Whether `file` sits under `root` by path components — separator style, redundant
+/// separators, and trailing slashes are all normalized away by `Path`.
+fn lexically_under_root(file: &Path, root: &str) -> bool {
+    !root.is_empty() && file.starts_with(root)
+}
+
+/// The path as reported in a notice: `[PROJECT_ROOT]/…` for files under the project
+/// root, absolute otherwise.
+///
+/// The root is stripped by *components*, never by byte prefix. A textual `replacen`
+/// disagrees with the [`lexically_under_root`] check whenever the two paths spell the
+/// same directory differently — `root = "/app/"` against `file = "/app/src/x.rs"`, or a
+/// Windows `root = r"C:\app"` against a cargo-emitted `C:/app/src/x.rs` — and the
+/// disagreement fails open, leaking the absolute build path into the payload.
+///
+/// The remainder is rejoined with `/` on every platform, so a fault's frames look the
+/// same however the crate was built.
+fn display_path(file: &Path, root: &str) -> String {
+    if lexically_under_root(file, root) {
+        if let Ok(rest) = file.strip_prefix(root) {
+            let rest: Vec<_> = rest
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy())
+                .collect();
+            return if rest.is_empty() {
+                PROJECT_ROOT.to_owned()
+            } else {
+                format!("{PROJECT_ROOT}/{}", rest.join("/"))
+            };
+        }
+    }
+    file.to_string_lossy().into_owned()
 }
 
 /// Symlink-aware containment: both sides are canonicalized before comparison, so a link
@@ -158,6 +182,62 @@ mod tests {
         assert_eq!(f.method.as_deref(), Some("my_app::checkout::charge"));
         assert_eq!(f.file.as_deref(), Some("[PROJECT_ROOT]/src/checkout.rs"));
         assert_eq!(f.number, Some(42));
+    }
+
+    /// The root substitution must agree with the containment check no matter how the two
+    /// paths spell the same directory. A byte-prefix `replacen` did not: it either
+    /// mangled the result or silently left the absolute build path in the payload.
+    #[test]
+    fn test_root_substitution_survives_separator_mismatch() {
+        let cases: &[(&str, &str)] = &[
+            // (root, file) — every one denotes /app + src/checkout.rs
+            ("/app", "/app/src/checkout.rs"),
+            ("/app/", "/app/src/checkout.rs"), // trailing slash on the root
+            ("/app", "/app//src/checkout.rs"), // doubled separator in the file
+            ("/app/", "/app//src/checkout.rs"),
+        ];
+        for (root, file) in cases {
+            let f = map_frame(
+                Some("my_app::checkout::charge"),
+                Some(Path::new(file)),
+                Some(42),
+                root,
+            )
+            .unwrap();
+            assert_eq!(
+                f.file.as_deref(),
+                Some("[PROJECT_ROOT]/src/checkout.rs"),
+                "root {root:?} + file {file:?}"
+            );
+        }
+    }
+
+    /// Cargo emits forward slashes in debug info on Windows while `CARGO_MANIFEST_DIR`
+    /// uses backslashes; `Path` treats both as separators, plain string matching does not.
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_mixed_separators_still_substituted() {
+        let f = map_frame(
+            Some("my_app::checkout::charge"),
+            Some(Path::new(r"C:/app/src/checkout.rs")),
+            Some(42),
+            r"C:\app",
+        )
+        .unwrap();
+        assert_eq!(f.file.as_deref(), Some("[PROJECT_ROOT]/src/checkout.rs"));
+    }
+
+    #[test]
+    fn test_empty_root_never_substitutes() {
+        let f = map_frame(
+            Some("my_app::x"),
+            Some(Path::new("/app/src/checkout.rs")),
+            Some(1),
+            "",
+        )
+        .unwrap();
+        assert_eq!(f.file.as_deref(), Some("/app/src/checkout.rs"));
+        assert!(f.source.is_none());
     }
 
     #[test]
