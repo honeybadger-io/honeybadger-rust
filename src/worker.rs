@@ -1,0 +1,367 @@
+//! The delivery worker: dedicated OS thread, bounded notice channel + unbounded
+//! control channel, throttle/suspend semantics (spec "Delivery architecture").
+use crate::transport::{Transport, TransportRequest};
+use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+const MAX_THROTTLE_EXP: i32 = 150;
+const MAX_THROTTLE_INTERVAL: Duration = Duration::from_secs(300);
+const SUSPEND_INTERVAL: Duration = Duration::from_secs(3600);
+
+pub(crate) enum Control {
+    Flush(Sender<bool>),
+    Shutdown(Sender<()>),
+}
+
+pub(crate) struct WorkerHandle {
+    notices: Sender<Vec<u8>>,
+    control: Sender<Control>,
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+pub(crate) fn throttle_interval(n: u32) -> Duration {
+    if n == 0 {
+        return Duration::ZERO;
+    }
+    let exp = (n as i64).min(MAX_THROTTLE_EXP as i64) as i32;
+    let secs = 1.05f64.powi(exp) - 1.0;
+    if !secs.is_finite() || secs <= 0.0 {
+        return Duration::ZERO;
+    }
+    MAX_THROTTLE_INTERVAL.min(Duration::from_secs_f64(secs.min(300.0)))
+}
+
+pub(crate) fn spawn(
+    transport: Arc<dyn Transport>,
+    queue_size: usize,
+) -> std::io::Result<WorkerHandle> {
+    spawn_with_intervals(transport, queue_size, SUSPEND_INTERVAL)
+}
+
+pub(crate) fn spawn_with_intervals(
+    transport: Arc<dyn Transport>,
+    queue_size: usize,
+    suspend_interval: Duration,
+) -> std::io::Result<WorkerHandle> {
+    let (notice_tx, notice_rx) = bounded(queue_size);
+    let (control_tx, control_rx) = unbounded();
+    let join = std::thread::Builder::new()
+        .name("honeybadger-worker".into())
+        .spawn(move || {
+            Worker {
+                transport,
+                notices: notice_rx,
+                control: control_rx,
+                throttle: 0,
+                suspend_interval,
+            }
+            .run()
+        })?;
+    Ok(WorkerHandle {
+        notices: notice_tx,
+        control: control_tx,
+        join: Mutex::new(Some(join)),
+    })
+}
+
+impl WorkerHandle {
+    /// Returns false if the payload was dropped (queue full or worker gone).
+    pub(crate) fn try_enqueue(&self, payload: Vec<u8>) -> bool {
+        match self.notices.try_send(payload) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        }
+    }
+
+    pub(crate) fn flush(&self, timeout: Duration) -> bool {
+        let (ack_tx, ack_rx) = bounded(1);
+        if self.control.send(Control::Flush(ack_tx)).is_err() {
+            return false;
+        }
+        ack_rx.recv_timeout(timeout).unwrap_or(false)
+    }
+
+    pub(crate) fn shutdown(&self, timeout: Duration) {
+        let (ack_tx, ack_rx) = bounded(1);
+        if self.control.send(Control::Shutdown(ack_tx)).is_err() {
+            return;
+        }
+        // Worker acks right before exiting; bounded wait, then join (instant) or detach.
+        if ack_rx.recv_timeout(timeout).is_ok() {
+            if let Some(handle) = self
+                .join
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                let _ = handle.join();
+            }
+        } else {
+            log::warn!("honeybadger: worker did not stop within {timeout:?}; detaching");
+            // Dropping the JoinHandle detaches; the thread exits after its current send.
+            self.join.lock().unwrap_or_else(|e| e.into_inner()).take();
+        }
+    }
+}
+
+enum SendOutcome {
+    Continue,
+    Suspend,
+}
+
+struct Worker {
+    transport: Arc<dyn Transport>,
+    notices: Receiver<Vec<u8>>,
+    control: Receiver<Control>,
+    throttle: u32,
+    suspend_interval: Duration,
+}
+
+impl Worker {
+    fn run(mut self) {
+        loop {
+            crossbeam_channel::select! {
+                recv(self.control) -> msg => match msg {
+                    Ok(control) => if self.handle_control(control) { return; },
+                    Err(_) => return, // all handles dropped
+                },
+                recv(self.notices) -> msg => match msg {
+                    Ok(payload) => {
+                        match self.send_one(&payload) {
+                            SendOutcome::Suspend => if self.suspended_wait() { return; },
+                            SendOutcome::Continue => if self.throttle_pause() { return; },
+                        }
+                    }
+                    Err(_) => return,
+                },
+            }
+        }
+    }
+
+    /// Returns true when the worker should exit.
+    fn handle_control(&mut self, control: Control) -> bool {
+        match control {
+            Control::Flush(ack) => {
+                self.drain_and_send();
+                let _ = ack.send(true);
+                false
+            }
+            Control::Shutdown(ack) => {
+                if self.throttle == 0 {
+                    self.drain_and_send();
+                } else {
+                    let dropped = self.drain_and_drop();
+                    if dropped > 0 {
+                        log::warn!(
+                            "honeybadger: dropping {dropped} queued notices at shutdown (throttled)"
+                        );
+                    }
+                }
+                let _ = ack.send(());
+                true
+            }
+        }
+    }
+
+    /// Barrier semantics: everything already in the notice channel is processed.
+    fn drain_and_send(&mut self) {
+        while let Ok(payload) = self.notices.try_recv() {
+            if matches!(self.send_one(&payload), SendOutcome::Suspend) {
+                let dropped = self.drain_and_drop();
+                log::warn!("honeybadger: suspended during flush; dropped {dropped} queued notices");
+                return;
+            }
+        }
+    }
+
+    fn drain_and_drop(&mut self) -> usize {
+        let mut count = 0;
+        while self.notices.try_recv().is_ok() {
+            count += 1;
+        }
+        count
+    }
+
+    fn send_one(&mut self, payload: &[u8]) -> SendOutcome {
+        let req = TransportRequest::notices(payload, false);
+        match self.transport.deliver(&req) {
+            Ok(status) if (200..300).contains(&status) => {
+                self.throttle = self.throttle.saturating_sub(1);
+                SendOutcome::Continue
+            }
+            Ok(429) | Ok(503) => {
+                self.throttle = self.throttle.saturating_add(1);
+                log::debug!("honeybadger: throttled (n={})", self.throttle);
+                SendOutcome::Continue
+            }
+            Ok(402) => {
+                log::warn!(
+                    "honeybadger: payment required; suspending delivery for {:?}",
+                    self.suspend_interval
+                );
+                SendOutcome::Suspend
+            }
+            Ok(403) => {
+                log::warn!(
+                    "honeybadger: unauthorized (bad API key or inactive account); suspending delivery for {:?}",
+                    self.suspend_interval
+                );
+                SendOutcome::Suspend
+            }
+            Ok(413) => {
+                log::warn!("honeybadger: payload too large; notice dropped");
+                SendOutcome::Continue
+            }
+            Ok(status) => {
+                log::warn!("honeybadger: unexpected API status {status}; notice dropped");
+                SendOutcome::Continue
+            }
+            Err(e) => {
+                log::warn!("honeybadger: delivery failed: {e}");
+                SendOutcome::Continue
+            }
+        }
+    }
+
+    /// Interruptible throttle pause. Returns true when the worker should exit.
+    fn throttle_pause(&mut self) -> bool {
+        let pause = throttle_interval(self.throttle);
+        if pause.is_zero() {
+            return false;
+        }
+        match self.control.recv_timeout(pause) {
+            Ok(control) => self.handle_control(control),
+            Err(RecvTimeoutError::Timeout) => false,
+            Err(RecvTimeoutError::Disconnected) => true,
+        }
+    }
+
+    /// Suspension: drop the queue, wait out the interval servicing control.
+    /// Returns true when the worker should exit.
+    fn suspended_wait(&mut self) -> bool {
+        let dropped = self.drain_and_drop();
+        if dropped > 0 {
+            log::warn!("honeybadger: dropped {dropped} queued notices (suspended)");
+        }
+        let deadline = Instant::now() + self.suspend_interval;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                self.throttle = 0; // reset on resume
+                self.drain_and_drop(); // anything accepted while suspended is stale
+                return false;
+            }
+            match self.control.recv_timeout(remaining) {
+                Ok(Control::Flush(ack)) => {
+                    self.drain_and_drop();
+                    let _ = ack.send(true); // queue empty by definition while suspended
+                }
+                Ok(Control::Shutdown(ack)) => {
+                    self.drain_and_drop();
+                    let _ = ack.send(());
+                    return true;
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => return true,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::{TestTransport, compress};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    fn payload() -> Vec<u8> {
+        compress(b"{}")
+    }
+
+    #[test]
+    fn test_throttle_interval_shape_and_saturation() {
+        assert_eq!(throttle_interval(0), Duration::ZERO);
+        assert!(throttle_interval(10) > Duration::ZERO);
+        assert!(throttle_interval(10) < throttle_interval(50));
+        assert_eq!(throttle_interval(10_000), Duration::from_secs(300)); // saturated, no panic
+        assert_eq!(throttle_interval(u32::MAX), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn test_delivers_and_flush_barrier() {
+        let transport = Arc::new(TestTransport::new());
+        let w = spawn(transport.clone(), 10).unwrap();
+        for _ in 0..3 {
+            assert!(w.try_enqueue(payload()));
+        }
+        assert!(w.flush(Duration::from_secs(5)));
+        assert_eq!(transport.requests().len(), 3);
+        w.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_queue_overflow_drops() {
+        let transport = Arc::new(TestTransport::new());
+        // Suspend delivery by pre-programming a 402 on the FIRST send, so the worker
+        // enters suspension and stops consuming; then overfill the queue.
+        transport.respond_with(402);
+        let w = spawn_with_intervals(transport.clone(), 2, Duration::from_secs(30)).unwrap();
+        assert!(w.try_enqueue(payload())); // consumed, triggers suspension
+        std::thread::sleep(Duration::from_millis(200)); // let suspension start
+        let mut accepted = 0;
+        for _ in 0..10 {
+            if w.try_enqueue(payload()) {
+                accepted += 1;
+            }
+        }
+        assert!(
+            accepted <= 2,
+            "bounded queue must reject overflow (accepted {accepted})"
+        );
+        w.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_suspend_on_403_drops_queue_but_flush_and_shutdown_work() {
+        let transport = Arc::new(TestTransport::new());
+        transport.respond_with(403);
+        let w = spawn_with_intervals(transport.clone(), 10, Duration::from_secs(30)).unwrap();
+        w.try_enqueue(payload()); // 403 → suspended
+        std::thread::sleep(Duration::from_millis(200));
+        w.try_enqueue(payload()); // lands in queue, will be dropped by suspension drain
+        assert!(
+            w.flush(Duration::from_secs(2)),
+            "flush must ack while suspended"
+        );
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "no delivery while suspended"
+        );
+        w.shutdown(Duration::from_secs(2)); // must return promptly despite 30s suspension
+    }
+
+    #[test]
+    fn test_throttle_429_slows_but_continues_and_recovers() {
+        let transport = Arc::new(TestTransport::new());
+        transport.respond_with(429);
+        let w = spawn(transport.clone(), 10).unwrap();
+        w.try_enqueue(payload()); // 429 → throttle n=1 (~0.05s pause)
+        w.try_enqueue(payload()); // 201 → n back to 0
+        w.try_enqueue(payload());
+        assert!(w.flush(Duration::from_secs(10)));
+        assert_eq!(transport.requests().len(), 3);
+        w.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_enqueue_after_shutdown_returns_false() {
+        let transport = Arc::new(TestTransport::new());
+        let w = spawn(transport, 10).unwrap();
+        w.shutdown(Duration::from_secs(5));
+        assert!(!w.try_enqueue(payload()));
+    }
+}

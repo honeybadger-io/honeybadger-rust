@@ -7,6 +7,7 @@ mod error;
 mod notice;
 mod sanitizer;
 mod transport;
+mod worker;
 
 pub use crate::breadcrumbs::Breadcrumb;
 pub use crate::config::{Config, ConfigBuilder};
