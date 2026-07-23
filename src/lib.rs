@@ -1,6 +1,7 @@
 //! The official Honeybadger error-tracking SDK for Rust. (Docs land in the final task.)
 
 mod breadcrumbs;
+mod bt;
 mod config;
 mod error;
 mod notice;
