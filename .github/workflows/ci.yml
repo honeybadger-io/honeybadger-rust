@@ -21,6 +21,8 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       # Catches undefined matrix keys, bad job/step keys, and shell mistakes that a
       # plain YAML parser accepts.
+      # Bump this digest BY HAND: Dependabot's github-actions ecosystem only tracks
+      # `owner/repo@ref`, so a `docker://` reference gets no update PRs.
       - name: Lint workflow files
         uses: docker://rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 # 1.7.12
         with:

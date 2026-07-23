@@ -1,0 +1,42 @@
+version: 2
+
+# Keeps the digest pins in .github/workflows/ci.yml and the Cargo dependencies current.
+# Digest pinning means upstream fixes no longer arrive on their own, so something has to
+# open the PRs — that is this file's whole job.
+#
+# NOT covered: the `docker://rhysd/actionlint@sha256:…` step. Dependabot's github-actions
+# ecosystem only understands `owner/repo@ref`; Docker registry references are out of
+# scope, so that digest has to be bumped by hand.
+# https://docs.github.com/en/code-security/reference/supply-chain-security/supported-ecosystems-and-repositories
+
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: deps
+    # Routine bumps arrive as one PR; majors stay separate, since those are the ones
+    # that need a human to read a changelog.
+    groups:
+      cargo-minor-and-patch:
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: Etc/UTC
+    commit-message:
+      prefix: ci
+    groups:
+      actions:
+        patterns:
+          - "*"
