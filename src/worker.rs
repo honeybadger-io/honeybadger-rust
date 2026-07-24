@@ -228,6 +228,17 @@ impl Worker {
                 );
                 SendOutcome::Suspend
             }
+            // A malformed key is 401, not 403, and it is not going to fix itself
+            // between one notice and the next. Falling through to the
+            // "unexpected status" arm below would drop notices one at a time,
+            // forever, under a message that names no cause.
+            Ok(401) => {
+                log::warn!(
+                    "honeybadger: unauthorized (malformed API key); suspending delivery for {:?}",
+                    self.suspend_interval
+                );
+                SendOutcome::Suspend
+            }
             Ok(403) => {
                 log::warn!(
                     "honeybadger: unauthorized (bad API key or inactive account); suspending delivery for {:?}",
@@ -342,6 +353,27 @@ mod tests {
         assert!(flush(&w, Duration::from_secs(5)));
         assert_eq!(transport.requests().len(), 3);
         w.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_suspend_on_401_stops_delivery() {
+        // The shared API-key middleware answers a malformed key with 401, not
+        // 403. Treating it as merely "unexpected" drops one notice per send for
+        // the life of the process, each with a message that names no cause.
+        let transport = Arc::new(TestTransport::new());
+        transport.respond_with(401);
+        let w =
+            spawn_with_intervals(transport.clone(), 10, Duration::from_secs(30), drops()).unwrap();
+        assert!(w.try_enqueue(payload()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(w.try_enqueue(payload()));
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "a 401 must suspend delivery rather than dropping notices one by one"
+        );
+        w.shutdown(Duration::from_secs(2));
     }
 
     #[test]

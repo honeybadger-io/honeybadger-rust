@@ -127,13 +127,30 @@ enum Outcome {
     Throttle {
         burn: bool,
     },
-    Suspend,
+    /// Nothing will change until a human acts. `reason` names which human
+    /// action, because the three statuses that land here have three different
+    /// remedies and a bare "suspended" line names none of them.
+    Suspend {
+        reason: &'static str,
+    },
 }
 
 fn classify(status: u16) -> Outcome {
     match status {
         200..=299 => Outcome::Success,
-        402 | 403 => Outcome::Suspend,
+        // Not a generic 4xx: the events endpoint answers 401 both for a
+        // malformed API key and for a project with no Insights stream — a plan
+        // without Insights. Dropping it as "the API rejected the batch" sends
+        // the user to inspect a payload that was never the problem.
+        401 => Outcome::Suspend {
+            reason: "unauthorized — the API key is malformed, or Insights is not enabled for this project",
+        },
+        402 => Outcome::Suspend {
+            reason: "payment required",
+        },
+        403 => Outcome::Suspend {
+            reason: "forbidden — bad API key, inactive account, or event ingestion disabled",
+        },
         429 => Outcome::Throttle { burn: false },
         503 => Outcome::Throttle { burn: true },
         400..=499 => Outcome::Drop { unexpected: None },
@@ -326,8 +343,8 @@ impl EventsWorker {
                     self.schedule_retry();
                     return;
                 }
-                Outcome::Suspend => {
-                    self.suspend();
+                Outcome::Suspend { reason } => {
+                    self.suspend(reason);
                     return;
                 }
             }
@@ -366,9 +383,10 @@ impl EventsWorker {
         self.retry_at = Instant::now().checked_add(backoff);
     }
 
-    /// 402/403: nothing will change until a human acts, so discard everything
-    /// outstanding and wait out the interval, still servicing control.
-    fn suspend(&mut self) {
+    /// 401/402/403: nothing will change until a human acts, so discard
+    /// everything outstanding and wait out the interval, still servicing
+    /// control.
+    fn suspend(&mut self, reason: &str) {
         let dropped = self.outstanding;
         self.retries.clear();
         self.current.clear();
@@ -380,7 +398,7 @@ impl EventsWorker {
             self.drops.record_many(dropped as u64);
         }
         log::warn!(
-            "honeybadger: events delivery suspended for {:?}",
+            "honeybadger: events delivery suspended for {:?}: {reason}",
             self.cfg.suspend_interval
         );
 
@@ -685,6 +703,47 @@ mod tests {
             "nothing is delivered while suspended"
         );
         // Must return promptly despite the 30s suspension.
+        w.shutdown(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_each_suspend_status_names_its_own_cause() {
+        // The three suspending statuses have three different remedies — enable
+        // Insights, fix billing, fix the key. One shared "suspended" line sends
+        // the user looking in the wrong place.
+        let reason = |status| match classify(status) {
+            Outcome::Suspend { reason } => reason,
+            _ => panic!("status {status} must suspend"),
+        };
+        assert!(reason(401).contains("Insights"), "401 is also 'no stream'");
+        assert!(reason(402).contains("payment"));
+        assert!(reason(403).contains("API key"));
+    }
+
+    #[test]
+    fn test_401_suspends_instead_of_dropping_batch_after_batch() {
+        // 401 is what the API answers for a malformed key, and for a project
+        // with no Insights stream provisioned — the plan does not include it.
+        // Neither is fixed by sending the next batch, and classifying it with
+        // the generic 4xx drop points the user at their payload instead.
+        let transport = Arc::new(TestTransport::new());
+        transport.respond_with(401);
+        let w = worker(
+            transport.clone(),
+            EventsConfig {
+                batch_size: 1,
+                ..cfg()
+            },
+        );
+        w.try_enqueue("{\"n\":1}".into());
+        std::thread::sleep(Duration::from_millis(250));
+        w.try_enqueue("{\"n\":2}".into());
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "a 401 must suspend delivery, not drop one batch and try the next"
+        );
         w.shutdown(Duration::from_secs(2));
     }
 
