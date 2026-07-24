@@ -59,9 +59,62 @@ impl<'a> TransportRequest<'a> {
     }
 }
 
+/// Longest `Retry-After` we will honor. The real ceiling is the daily data
+/// limit, which resets at most 24 hours out; anything beyond that is a bug or a
+/// hostile proxy, and obeying it would park a pipeline indefinitely.
+pub(crate) const MAX_RETRY_AFTER: Duration = Duration::from_secs(86_400);
+
+/// Reads a `Retry-After` value, honoring only the delta-seconds form.
+///
+/// The HTTP-date form is equally legal, but the Honeybadger API does not send
+/// it, and misreading a date as a second count would be worse than falling back
+/// to the SDK's own backoff curve. Clamped to [`MAX_RETRY_AFTER`].
+pub(crate) fn parse_retry_after(header: Option<&str>) -> Option<Duration> {
+    let seconds: u64 = header?.trim().parse().ok()?;
+    Some(MAX_RETRY_AFTER.min(Duration::from_secs(seconds)))
+}
+
+/// One response from the API.
+///
+/// Carries the status plus the parts of the response the delivery workers act
+/// on. Build it with [`TransportResponse::new`], or `status.into()` when there
+/// is nothing else to report.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TransportResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// The response's `Retry-After` as a duration, when it sent a parseable one.
+    /// A worker backing off prefers this over its own curve, so a rate-limited
+    /// endpoint is retried when it said to be rather than on our schedule.
+    pub retry_after: Option<Duration>,
+}
+
+impl TransportResponse {
+    /// A response carrying only a status.
+    pub fn new(status: u16) -> Self {
+        TransportResponse {
+            status,
+            retry_after: None,
+        }
+    }
+
+    /// Attaches the `Retry-After` this response carried.
+    pub fn retry_after(mut self, after: Option<Duration>) -> Self {
+        self.retry_after = after;
+        self
+    }
+}
+
+impl From<u16> for TransportResponse {
+    fn from(status: u16) -> Self {
+        TransportResponse::new(status)
+    }
+}
+
 /// A delivery failure: connection refused, timeout, TLS error, or a panicking
 /// [`Transport`] impl. A non-2xx *response* is not an error — it comes back as
-/// `Ok(status)` so the worker can pick the right backoff.
+/// `Ok(response)` so the worker can pick the right backoff.
 #[derive(Debug)]
 pub struct TransportError(
     /// Human-readable description of what went wrong.
@@ -77,18 +130,21 @@ impl std::error::Error for TransportError {}
 
 /// The delivery seam. Implement this to intercept or fake HTTP delivery.
 pub trait Transport: Send + Sync {
-    /// Delivers one request, returning the HTTP status.
+    /// Delivers one request, returning what the server answered.
     ///
-    /// Return `Ok(status)` for *any* response the server produced, including 4xx and
-    /// 5xx: the worker reads 402/403 as "suspend", 429/503 as "throttle", and anything
-    /// else unexpected as a dropped notice. Reserve `Err` for requests that never got a
-    /// response at all.
+    /// Return `Ok(response)` for *any* response the server produced, including 4xx and
+    /// 5xx: the worker reads 401/402/403 as "suspend", 429/503 as "throttle", and
+    /// anything else unexpected as a dropped notice. Reserve `Err` for requests that
+    /// never got a response at all.
+    ///
+    /// A status alone converts with `Ok(201.into())`. Report `Retry-After` when the
+    /// response carried one — see [`TransportResponse::retry_after`].
     ///
     /// Implementations must not block indefinitely — on the urgent path the caller is a
     /// process on its way out. A panicking implementation is caught and counted as a
     /// transport error rather than taking the worker down — though only in unwinding
     /// builds; under `panic = "abort"` no `catch_unwind` in any crate can help.
-    fn deliver(&self, req: &TransportRequest) -> Result<u16, TransportError>;
+    fn deliver(&self, req: &TransportRequest) -> Result<TransportResponse, TransportError>;
 }
 
 pub(crate) fn compress(body: &[u8]) -> Vec<u8> {
@@ -141,7 +197,7 @@ impl ServerTransport {
 }
 
 impl Transport for ServerTransport {
-    fn deliver(&self, req: &TransportRequest) -> Result<u16, TransportError> {
+    fn deliver(&self, req: &TransportRequest) -> Result<TransportResponse, TransportError> {
         let url = format!("{}{}", self.endpoint, req.path);
         let agent = if req.urgent {
             &self.urgent_agent
@@ -156,7 +212,14 @@ impl Transport for ServerTransport {
             .header("Content-Encoding", "deflate")
             .header("User-Agent", &self.user_agent)
             .send(req.body)
-            .map(|resp| resp.status().as_u16())
+            .map(|resp| {
+                let retry_after = parse_retry_after(
+                    resp.headers()
+                        .get("retry-after")
+                        .and_then(|v| v.to_str().ok()),
+                );
+                TransportResponse::new(resp.status().as_u16()).retry_after(retry_after)
+            })
             .map_err(|e| TransportError(e.to_string()))
     }
 }
@@ -166,13 +229,13 @@ impl Transport for ServerTransport {
 pub(crate) struct NullTransport;
 
 impl Transport for NullTransport {
-    fn deliver(&self, req: &TransportRequest) -> Result<u16, TransportError> {
+    fn deliver(&self, req: &TransportRequest) -> Result<TransportResponse, TransportError> {
         log::debug!(
             "honeybadger: reporting disabled; dropping {} bytes to {}",
             req.body.len(),
             req.path
         );
-        Ok(201)
+        Ok(201.into())
     }
 }
 
@@ -197,7 +260,7 @@ pub struct CapturedRequest {
 #[derive(Default)]
 pub struct TestTransport {
     requests: Mutex<Vec<CapturedRequest>>,
-    responses: Mutex<Vec<u16>>,
+    responses: Mutex<Vec<TransportResponse>>,
 }
 
 impl TestTransport {
@@ -208,10 +271,20 @@ impl TestTransport {
 
     /// Queue a status for the next delivery (FIFO). Unqueued deliveries return 201.
     pub fn respond_with(&self, status: u16) {
+        self.respond_with_response(status.into());
+    }
+
+    /// Queue a status carrying a `Retry-After`, for exercising a worker's backoff.
+    pub fn respond_with_retry_after(&self, status: u16, after: Duration) {
+        self.respond_with_response(TransportResponse::new(status).retry_after(Some(after)));
+    }
+
+    /// Queue a fully built response for the next delivery (FIFO).
+    pub fn respond_with_response(&self, response: TransportResponse) {
         self.responses
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .push(status);
+            .push(response);
     }
 
     /// Snapshot of every request delivered so far, oldest first.
@@ -230,7 +303,7 @@ impl TestTransport {
 }
 
 impl Transport for TestTransport {
-    fn deliver(&self, req: &TransportRequest) -> Result<u16, TransportError> {
+    fn deliver(&self, req: &TransportRequest) -> Result<TransportResponse, TransportError> {
         self.requests
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -243,7 +316,7 @@ impl Transport for TestTransport {
             });
         let mut responses = self.responses.lock().unwrap_or_else(|e| e.into_inner());
         Ok(if responses.is_empty() {
-            201
+            201.into()
         } else {
             responses.remove(0)
         })
@@ -275,8 +348,8 @@ mod tests {
         t.respond_with(429);
         let body = compress(b"{}");
         let req = TransportRequest::notices(&body, false);
-        assert_eq!(t.deliver(&req).unwrap(), 429);
-        assert_eq!(t.deliver(&req).unwrap(), 201); // programmed statuses consumed; default 201
+        assert_eq!(t.deliver(&req).unwrap().status, 429);
+        assert_eq!(t.deliver(&req).unwrap().status, 201); // programmed consumed; default 201
         let captured = t.requests();
         assert_eq!(captured.len(), 2);
         assert_eq!(captured[0].path, "/v1/notices");
@@ -301,7 +374,10 @@ mod tests {
             std::time::Duration::from_secs(5),
         );
         let body = compress(b"{\"api\":\"payload\"}");
-        let status = t.deliver(&TransportRequest::notices(&body, false)).unwrap();
+        let status = t
+            .deliver(&TransportRequest::notices(&body, false))
+            .unwrap()
+            .status;
         assert_eq!(status, 201);
         mock.assert();
     }
@@ -318,7 +394,9 @@ mod tests {
         );
         let body = compress(b"{}");
         assert_eq!(
-            t.deliver(&TransportRequest::notices(&body, false)).unwrap(),
+            t.deliver(&TransportRequest::notices(&body, false))
+                .unwrap()
+                .status,
             429
         );
     }
@@ -360,8 +438,74 @@ mod tests {
             std::time::Duration::from_secs(5),
         );
         let body = compress(b"{\"event_type\":\"x\"}");
-        assert_eq!(t.deliver(&TransportRequest::events(&body)).unwrap(), 201);
+        assert_eq!(
+            t.deliver(&TransportRequest::events(&body)).unwrap().status,
+            201
+        );
         mock.assert();
+    }
+
+    #[test]
+    fn test_retry_after_parses_seconds_and_ignores_the_rest() {
+        assert_eq!(
+            parse_retry_after(Some("120")),
+            Some(Duration::from_secs(120))
+        );
+        assert_eq!(
+            parse_retry_after(Some(" 30 ")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(parse_retry_after(None), None);
+        // The HTTP-date form is legal but our API never sends it. Reading it as
+        // seconds would be worse than falling back to our own curve.
+        assert_eq!(
+            parse_retry_after(Some("Wed, 21 Oct 2026 07:28:00 GMT")),
+            None
+        );
+        assert_eq!(parse_retry_after(Some("-5")), None, "negative is nonsense");
+        assert_eq!(
+            parse_retry_after(Some("99999999")),
+            Some(MAX_RETRY_AFTER),
+            "a server that says 'wait a year' must not park the pipeline for one"
+        );
+    }
+
+    #[test]
+    fn test_server_transport_surfaces_retry_after() {
+        // The events endpoint sends Retry-After with its 429 — seconds until the
+        // daily limit resets. The worker cannot honor a header it never sees.
+        let mut server = mockito::Server::new();
+        server
+            .mock("POST", "/v1/events")
+            .with_status(429)
+            .with_header("Retry-After", "120")
+            .create();
+        let t = ServerTransport::new(
+            server.url(),
+            "k".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let body = compress(b"{}");
+        let resp = t.deliver(&TransportRequest::events(&body)).unwrap();
+        assert_eq!(resp.status, 429);
+        assert_eq!(resp.retry_after, Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn test_a_response_without_the_header_reports_none() {
+        let mut server = mockito::Server::new();
+        server.mock("POST", "/v1/events").with_status(201).create();
+        let t = ServerTransport::new(
+            server.url(),
+            "k".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let body = compress(b"{}");
+        let resp = t.deliver(&TransportRequest::events(&body)).unwrap();
+        assert_eq!(resp.status, 201);
+        assert_eq!(resp.retry_after, None);
     }
 
     #[test]

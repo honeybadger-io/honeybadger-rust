@@ -295,7 +295,7 @@ impl EventsWorker {
                 // from inside the hook, and a panic there aborts the process.
                 let _suppressed = crate::panic_hook::suppress_reporting();
                 match catch_unwind(AssertUnwindSafe(|| self.transport.deliver(&req))) {
-                    Ok(Ok(status)) => classify(status),
+                    Ok(Ok(resp)) => classify(resp.status),
                     Ok(Err(e)) => {
                         log::warn!("honeybadger: events delivery failed: {e}");
                         Outcome::Retry
@@ -780,18 +780,21 @@ mod tests {
 
     #[test]
     fn test_panicking_transport_does_not_kill_the_worker() {
-        use crate::transport::{Transport, TransportError, TransportRequest};
+        use crate::transport::{Transport, TransportError, TransportRequest, TransportResponse};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct PanicOnFirst {
             calls: AtomicUsize,
         }
         impl Transport for PanicOnFirst {
-            fn deliver(&self, _req: &TransportRequest) -> Result<u16, TransportError> {
+            fn deliver(
+                &self,
+                _req: &TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     panic!("transport blew up");
                 }
-                Ok(201)
+                Ok(201.into())
             }
         }
 
@@ -980,17 +983,20 @@ mod tests {
         // which reports the panic by calling that same transport again — a
         // panic inside the panic hook, which aborts the process. The scenario
         // needs the global hook installed, so assert the guard directly.
-        use crate::transport::{Transport, TransportError, TransportRequest};
+        use crate::transport::{Transport, TransportError, TransportRequest, TransportResponse};
         use std::sync::atomic::{AtomicBool, Ordering};
 
         struct Spy {
             suppressed: AtomicBool,
         }
         impl Transport for Spy {
-            fn deliver(&self, _req: &TransportRequest) -> Result<u16, TransportError> {
+            fn deliver(
+                &self,
+                _req: &TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
                 self.suppressed
                     .store(crate::panic_hook::is_suppressed(), Ordering::SeqCst);
-                Ok(201)
+                Ok(201.into())
             }
         }
 

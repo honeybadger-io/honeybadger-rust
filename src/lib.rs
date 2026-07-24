@@ -137,4 +137,5 @@ pub use crate::global::{
 pub use crate::notice::Notice;
 pub use crate::transport::{
     CapturedRequest, RequestKind, TestTransport, Transport, TransportError, TransportRequest,
+    TransportResponse,
 };

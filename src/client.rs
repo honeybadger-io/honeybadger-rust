@@ -106,7 +106,7 @@ impl Client {
             // the panic hook that called us.
             let result = catch_unwind(AssertUnwindSafe(|| self.0.transport.deliver(&req)))
                 .unwrap_or_else(|_| Err(TransportError("transport panicked".into())));
-            match result {
+            match result.map(|resp| resp.status) {
                 Ok(status) if (200..300).contains(&status) => {}
                 Ok(status) => log::warn!("honeybadger: urgent delivery got status {status}"),
                 Err(e) => log::warn!("honeybadger: urgent delivery failed: {e}"),
@@ -1013,7 +1013,7 @@ mod tests {
             fn deliver(
                 &self,
                 _req: &crate::TransportRequest,
-            ) -> Result<u16, crate::TransportError> {
+            ) -> Result<crate::TransportResponse, crate::TransportError> {
                 panic!("urgent transport blew up");
             }
         }

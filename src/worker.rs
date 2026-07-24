@@ -210,7 +210,7 @@ impl Worker {
             catch_unwind(AssertUnwindSafe(|| self.transport.deliver(&req)))
                 .unwrap_or_else(|_| Err(TransportError("transport panicked".into())))
         };
-        match result {
+        match result.map(|resp| resp.status) {
             Ok(status) if (200..300).contains(&status) => {
                 self.throttle = self.throttle.saturating_sub(1);
                 self.drops.report();
@@ -431,18 +431,21 @@ mod tests {
 
     #[test]
     fn test_panicking_transport_does_not_kill_the_worker() {
-        use crate::transport::{Transport, TransportError, TransportRequest};
+        use crate::transport::{Transport, TransportError, TransportRequest, TransportResponse};
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         struct PanicOnFirst {
             calls: AtomicUsize,
         }
         impl Transport for PanicOnFirst {
-            fn deliver(&self, _req: &TransportRequest) -> Result<u16, TransportError> {
+            fn deliver(
+                &self,
+                _req: &TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
                 if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
                     panic!("transport blew up");
                 }
-                Ok(201)
+                Ok(201.into())
             }
         }
 
@@ -496,17 +499,20 @@ mod tests {
         // See the events worker's twin of this test: without the guard a
         // panicking transport is re-entered from inside our own panic hook,
         // which aborts the process rather than containing the panic.
-        use crate::transport::{Transport, TransportError, TransportRequest};
+        use crate::transport::{Transport, TransportError, TransportRequest, TransportResponse};
         use std::sync::atomic::{AtomicBool, Ordering};
 
         struct Spy {
             suppressed: AtomicBool,
         }
         impl Transport for Spy {
-            fn deliver(&self, _req: &TransportRequest) -> Result<u16, TransportError> {
+            fn deliver(
+                &self,
+                _req: &TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
                 self.suppressed
                     .store(crate::panic_hook::is_suppressed(), Ordering::SeqCst);
-                Ok(201)
+                Ok(201.into())
             }
         }
 
