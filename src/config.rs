@@ -233,8 +233,9 @@ impl ConfigBuilder {
         self.notice_queue_size = Some(v);
         self
     }
-    /// TCP connect timeout for delivery. Default: 2s. (Panic notices use a fixed,
-    /// shorter timeout: the process is already on its way out.)
+    /// TCP connect timeout for delivery. Default: 4s — enough for a cold TLS
+    /// handshake, which 2s was not. (Panic notices use a fixed, shorter timeout:
+    /// the process is already on its way out.)
     pub fn connect_timeout(mut self, v: Duration) -> Self {
         self.connect_timeout = Some(v);
         self
@@ -455,7 +456,7 @@ impl ConfigBuilder {
             breadcrumbs_enabled: self.breadcrumbs_enabled.unwrap_or(true),
             install_panic_hook: self.install_panic_hook.unwrap_or(true),
             notice_queue_size: self.notice_queue_size.unwrap_or(100),
-            connect_timeout: self.connect_timeout.unwrap_or(Duration::from_secs(2)),
+            connect_timeout: self.connect_timeout.unwrap_or(Duration::from_secs(4)),
             request_timeout: self.request_timeout.unwrap_or(Duration::from_secs(5)),
             before_notify: self.before_notify,
             events_enabled: self
@@ -615,7 +616,9 @@ mod tests {
                 "secret".to_string()
             ]
         );
-        assert_eq!(cfg.connect_timeout, Duration::from_secs(2));
+        // 2s was too tight for a cold TLS handshake: an observed first delivery
+        // timed out on connect and only succeeded on the retry.
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(4));
         assert_eq!(cfg.request_timeout, Duration::from_secs(5));
         assert!(cfg.breadcrumbs_enabled);
         assert!(cfg.install_panic_hook);
