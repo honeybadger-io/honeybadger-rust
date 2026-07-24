@@ -106,18 +106,18 @@ fn lexically_under_root(file: &Path, root: &str) -> bool {
 /// The remainder is rejoined with `/` on every platform, so a fault's frames look the
 /// same however the crate was built.
 fn display_path(file: &Path, root: &str) -> String {
-    if lexically_under_root(file, root) {
-        if let Ok(rest) = file.strip_prefix(root) {
-            let rest: Vec<_> = rest
-                .components()
-                .map(|c| c.as_os_str().to_string_lossy())
-                .collect();
-            return if rest.is_empty() {
-                PROJECT_ROOT.to_owned()
-            } else {
-                format!("{PROJECT_ROOT}/{}", rest.join("/"))
-            };
-        }
+    if lexically_under_root(file, root)
+        && let Ok(rest) = file.strip_prefix(root)
+    {
+        let rest: Vec<_> = rest
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect();
+        return if rest.is_empty() {
+            PROJECT_ROOT.to_owned()
+        } else {
+            format!("{PROJECT_ROOT}/{}", rest.join("/"))
+        };
     }
     file.to_string_lossy().into_owned()
 }
