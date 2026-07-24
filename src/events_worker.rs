@@ -1,7 +1,7 @@
 //! The events delivery worker: dedicated OS thread, bounded event channel plus
 //! an unbounded control channel, batching on count, bytes, or time.
 use crate::drops::DropCounter;
-use crate::transport::{Transport, TransportRequest, compress};
+use crate::transport::{Transport, TransportRequest, TransportResponse, compress};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender, TrySendError, bounded, unbounded};
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -123,9 +123,11 @@ enum Outcome {
         unexpected: Option<u16>,
     },
     /// Back off. `burn` distinguishes 503 (a server error) from 429 (an
-    /// instruction to wait, which must not age a batch out).
+    /// instruction to wait, which must not age a batch out). `retry_after`
+    /// carries the server's own answer to "when", when it gave one.
     Throttle {
         burn: bool,
+        retry_after: Option<Duration>,
     },
     /// Nothing will change until a human acts. `reason` names which human
     /// action, because the three statuses that land here have three different
@@ -135,8 +137,8 @@ enum Outcome {
     },
 }
 
-fn classify(status: u16) -> Outcome {
-    match status {
+fn classify(resp: &TransportResponse) -> Outcome {
+    match resp.status {
         200..=299 => Outcome::Success,
         // Not a generic 4xx: the events endpoint answers 401 both for a
         // malformed API key and for a project with no Insights stream — a plan
@@ -151,8 +153,14 @@ fn classify(status: u16) -> Outcome {
         403 => Outcome::Suspend {
             reason: "forbidden — bad API key, inactive account, or event ingestion disabled",
         },
-        429 => Outcome::Throttle { burn: false },
-        503 => Outcome::Throttle { burn: true },
+        429 => Outcome::Throttle {
+            burn: false,
+            retry_after: resp.retry_after,
+        },
+        503 => Outcome::Throttle {
+            burn: true,
+            retry_after: resp.retry_after,
+        },
         400..=499 => Outcome::Drop { unexpected: None },
         500..=599 => Outcome::Retry,
         // 1xx, 3xx, and anything out of range: undefined by the API, so the
@@ -295,7 +303,7 @@ impl EventsWorker {
                 // from inside the hook, and a panic there aborts the process.
                 let _suppressed = crate::panic_hook::suppress_reporting();
                 match catch_unwind(AssertUnwindSafe(|| self.transport.deliver(&req))) {
-                    Ok(Ok(resp)) => classify(resp.status),
+                    Ok(Ok(resp)) => classify(&resp),
                     Ok(Err(e)) => {
                         log::warn!("honeybadger: events delivery failed: {e}");
                         Outcome::Retry
@@ -331,16 +339,16 @@ impl EventsWorker {
                     if self.charge_attempt() {
                         continue; // aged out; try the next batch
                     }
-                    self.schedule_retry();
+                    self.schedule_retry(None);
                     return;
                 }
-                Outcome::Throttle { burn } => {
+                Outcome::Throttle { burn, retry_after } => {
                     self.throttle = self.throttle.saturating_add(1);
                     log::debug!("honeybadger: events throttled (n={})", self.throttle);
                     if burn && self.charge_attempt() {
                         continue;
                     }
-                    self.schedule_retry();
+                    self.schedule_retry(retry_after);
                     return;
                 }
                 Outcome::Suspend { reason } => {
@@ -376,10 +384,15 @@ impl EventsWorker {
         true
     }
 
-    fn schedule_retry(&mut self) {
-        // Reuse the shipped notices curve, floored at one flush interval so a
-        // batch retry never becomes a hot loop.
-        let backoff = crate::worker::throttle_interval(self.throttle).max(self.cfg.flush_interval);
+    fn schedule_retry(&mut self, retry_after: Option<Duration>) {
+        // A server-supplied Retry-After wins over the curve: the daily data
+        // limit resets at a time only the server knows, and guessing means
+        // retrying for hours at the rate that provoked the limit.
+        //
+        // Floored at one flush interval either way, so neither a shallow curve
+        // nor a literal `Retry-After: 0` becomes a hot loop.
+        let curve = crate::worker::throttle_interval(self.throttle);
+        let backoff = retry_after.unwrap_or(curve).max(self.cfg.flush_interval);
         self.retry_at = Instant::now().checked_add(backoff);
     }
 
@@ -662,6 +675,60 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_after_is_honored_in_place_of_our_own_curve() {
+        // The events endpoint sends Retry-After with its daily-limit 429 —
+        // seconds until the limit resets, up to a full day. Ignoring it means
+        // retrying every flush interval until midnight, at exactly the rate that
+        // provoked the limit.
+        let transport = Arc::new(TestTransport::new());
+        for _ in 0..20 {
+            transport.respond_with_retry_after(429, Duration::from_secs(2));
+        }
+        let w = worker(
+            transport.clone(),
+            EventsConfig {
+                batch_size: 1,
+                flush_interval: Duration::from_millis(100),
+                ..cfg()
+            },
+        );
+        w.try_enqueue("{\"n\":1}".into());
+        std::thread::sleep(Duration::from_millis(700));
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "Retry-After said 2s; the curve alone would have retried by now"
+        );
+        w.shutdown(Duration::from_secs(2));
+    }
+
+    #[test]
+    fn test_a_zero_retry_after_does_not_become_a_hot_loop() {
+        // `Retry-After: 0` is legal. Taken literally it would retry as fast as
+        // the loop can turn, which is the one thing a backoff must never do.
+        let transport = Arc::new(TestTransport::new());
+        for _ in 0..200 {
+            transport.respond_with_retry_after(429, Duration::ZERO);
+        }
+        let w = worker(
+            transport.clone(),
+            EventsConfig {
+                batch_size: 1,
+                flush_interval: Duration::from_millis(400),
+                ..cfg()
+            },
+        );
+        w.try_enqueue("{\"n\":1}".into());
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "a zero Retry-After must still floor at one flush interval"
+        );
+        w.shutdown(Duration::from_secs(2));
+    }
+
+    #[test]
     fn test_429_burns_no_retry_budget_but_503_does() {
         // A rate limit is an instruction to wait, not a failure, so it must not
         // age a batch out. A 503 carries no such instruction.
@@ -711,7 +778,7 @@ mod tests {
         // The three suspending statuses have three different remedies — enable
         // Insights, fix billing, fix the key. One shared "suspended" line sends
         // the user looking in the wrong place.
-        let reason = |status| match classify(status) {
+        let reason = |status| match classify(&TransportResponse::new(status)) {
             Outcome::Suspend { reason } => reason,
             _ => panic!("status {status} must suspend"),
         };

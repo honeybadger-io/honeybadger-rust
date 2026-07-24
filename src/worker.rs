@@ -59,6 +59,7 @@ pub(crate) fn spawn_with_intervals(
                 notices: notice_rx,
                 control: control_rx,
                 throttle: 0,
+                retry_after: None,
                 suspend_interval,
                 drops,
             }
@@ -116,6 +117,8 @@ struct Worker {
     notices: Receiver<Vec<u8>>,
     control: Receiver<Control>,
     throttle: u32,
+    /// `Retry-After` from the last throttling response, spent on the next pause.
+    retry_after: Option<Duration>,
     suspend_interval: Duration,
     drops: Arc<DropCounter>,
 }
@@ -210,6 +213,7 @@ impl Worker {
             catch_unwind(AssertUnwindSafe(|| self.transport.deliver(&req)))
                 .unwrap_or_else(|_| Err(TransportError("transport panicked".into())))
         };
+        let retry_after = result.as_ref().ok().and_then(|resp| resp.retry_after);
         match result.map(|resp| resp.status) {
             Ok(status) if (200..300).contains(&status) => {
                 self.throttle = self.throttle.saturating_sub(1);
@@ -218,6 +222,7 @@ impl Worker {
             }
             Ok(429) | Ok(503) => {
                 self.throttle = self.throttle.saturating_add(1);
+                self.retry_after = retry_after;
                 log::debug!("honeybadger: throttled (n={})", self.throttle);
                 SendOutcome::Continue
             }
@@ -263,7 +268,17 @@ impl Worker {
 
     /// Interruptible throttle pause. Returns true when the worker should exit.
     fn throttle_pause(&mut self) -> bool {
-        let pause = throttle_interval(self.throttle);
+        // The notices endpoint does not send Retry-After today — its two 429s
+        // carry no headers, unlike the events endpoint's. This is here for the
+        // responses we do not author: an edge or proxy in front of the API can
+        // answer 429 or 503 with one, and 503s commonly do. When a response
+        // carries it, it beats guessing; floored at the curve so a literal
+        // `Retry-After: 0` cannot tighten the loop.
+        let curve = throttle_interval(self.throttle);
+        let pause = match self.retry_after.take() {
+            Some(after) => after.max(curve),
+            None => curve,
+        };
         if pause.is_zero() {
             return false;
         }
@@ -353,6 +368,26 @@ mod tests {
         assert!(flush(&w, Duration::from_secs(5)));
         assert_eq!(transport.requests().len(), 3);
         w.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_throttle_pause_honors_retry_after() {
+        // Our notices endpoint does not set this header; an edge answering 429 or
+        // 503 on its behalf can, and a response that says when to come back knows
+        // more than our curve does — ~50ms on a first throttle.
+        let transport = Arc::new(TestTransport::new());
+        transport.respond_with_retry_after(429, Duration::from_secs(2));
+        let w = spawn(transport.clone(), 10, drops()).unwrap();
+        assert!(w.try_enqueue(payload()));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(w.try_enqueue(payload()));
+        std::thread::sleep(Duration::from_millis(400));
+        assert_eq!(
+            transport.requests().len(),
+            1,
+            "the second notice must wait out Retry-After, not the ~50ms curve"
+        );
+        w.shutdown(Duration::from_secs(2));
     }
 
     #[test]
