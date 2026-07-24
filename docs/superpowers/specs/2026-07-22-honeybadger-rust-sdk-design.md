@@ -18,7 +18,7 @@ Where the two references disagree, this design records which side we took and wh
 
 - Official Honeybadger SDK. Repo: this directory (`honeybadger-rust`), destined for the honeybadger-io GitHub org.
 - Crate name: `honeybadger`, contingent on transferring the crates.io name from its current owner (fussybeaver — outreach happens in parallel with development; publishing is the final step regardless). Fallback if transfer falls through: `honeybadger-sdk`. Nothing in the code depends on the crate name beyond `Cargo.toml` and doc links.
-- Edition 2024, MSRV 1.85. Single crate in Phase 1; module boundaries are drawn so Phase 2 (events) and later integration crates (`honeybadger-tower`, a `tracing` layer) attach without restructuring.
+- Edition 2024, MSRV 1.88 (raised from 1.85 in Phase 2, which uses let-chains). Single crate in Phase 1; module boundaries are drawn so Phase 2 (events) and later integration crates (`honeybadger-tower`, a `tracing` layer) attach without restructuring.
 
 ## Phasing
 
@@ -245,7 +245,7 @@ The SDK's guarantee, stated precisely: **SDK-authored code never panics; user-su
 - **Worker semantics** against `Test` transport with tuned-down intervals: queue overflow drops + warns, control channel unaffected by full queue, throttle increment/decrement and saturation, suspend on 402/403 (control messages still serviced, flush acks true, queue dropped), flush barrier ordering with a concurrent producer, shutdown drains, shutdown-while-throttled abandons and interrupts the sleep.
 - **HTTP integration** against mockito with the real `Server` transport: header set, deflate round-trip (inflate the received body and compare), status→behavior mapping.
 - **Panic hook:** integration tests against **dedicated fixture binaries** (not `#[test]` functions — the test harness overrides panic behavior): one built with default unwind, one with `panic = "abort"` in its profile, each asserting the notice reaches a local mock endpoint before process exit. Plus a recursion test (panic inside a before_notify hook during panic handling) asserting no abort and no infinite loop, and a hook-chaining test (previously installed hook still runs).
-- **CI:** GitHub Actions — `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test`, examples build, MSRV (1.85) check job.
+- **CI:** GitHub Actions — `cargo fmt --check`, `clippy --all-targets -D warnings`, `cargo test`, examples build, MSRV (1.88) check job.
 
 ## Deferred / out of scope for Phase 1
 
