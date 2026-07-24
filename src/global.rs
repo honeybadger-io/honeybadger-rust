@@ -115,6 +115,61 @@ pub fn add_breadcrumb(message: &str, category: &str, metadata: Option<Map<String
     with_client(|c| c.add_breadcrumb(message, category, metadata));
 }
 
+/// Sends an Insights event through the global client. A no-op before [`init`].
+///
+/// `event_type` always wins over any `event_type` key in `payload`, and the
+/// payload must be a JSON object. See [`crate::Client::event`].
+///
+/// ```rust,no_run
+/// use serde_json::json;
+/// honeybadger::event("user.created", json!({ "user_id": 7, "plan": "pro" }));
+/// ```
+pub fn event(event_type: &str, payload: Value) {
+    with_client(|c| c.event(event_type, payload));
+}
+
+/// Sends an Insights event whose `event_type` is already in the payload.
+/// A no-op before [`init`].
+pub fn event_value(payload: Value) {
+    with_client(|c| c.event_value(payload));
+}
+
+/// Merges key/value pairs into the **process-wide** event context attached to
+/// every later event. A no-op before [`init`].
+///
+/// Like [`context`], this store is shared by the whole process and is not
+/// request-scoped; see [the crate docs](crate#context-is-process-wide). Setting
+/// a key to [`serde_json::Value::Null`] removes it.
+pub fn event_context<I, K>(entries: I)
+where
+    I: IntoIterator<Item = (K, Value)>,
+    K: Into<String>,
+{
+    with_client(|c| c.event_context(entries));
+}
+
+/// Clears the **process-wide** event context, leaving notice context untouched.
+/// A no-op before [`init`].
+pub fn clear_event_context() {
+    with_client(|c| c.clear_event_context());
+}
+
+/// Sets the **process-wide** request id correlating notices with events and
+/// driving deterministic sampling. A no-op before [`init`].
+///
+/// This slot carries the same hazard as [`context`]: under concurrency one
+/// request's id overwrites another's, so an event can be attributed and sampled
+/// as the wrong request. In a concurrent server put `request_id` in the event
+/// payload instead. See [`crate::Client::request_id`].
+pub fn request_id(id: impl Into<String>) {
+    with_client(|c| c.request_id(id));
+}
+
+/// Clears the process-wide request id. A no-op before [`init`].
+pub fn clear_request_id() {
+    with_client(|c| c.clear_request_id());
+}
+
 /// Flushes the global client, returning `false` if it is uninitialized or the timeout
 /// expired first.
 pub fn flush(timeout: Duration) -> bool {
@@ -157,5 +212,16 @@ mod tests {
         assert!(global_client().is_some());
         drop(guard2);
         assert!(global_client().is_none());
+    }
+
+    #[test]
+    fn test_event_functions_are_no_ops_before_init() {
+        // Must not panic, must not spawn anything.
+        crate::event("t", serde_json::json!({ "a": 1 }));
+        crate::event_value(serde_json::json!({ "event_type": "t" }));
+        crate::event_context([("k", serde_json::json!(1))]);
+        crate::request_id("req-1");
+        crate::clear_request_id();
+        crate::clear_event_context();
     }
 }

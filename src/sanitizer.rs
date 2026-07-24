@@ -27,24 +27,32 @@ impl Sanitizer {
     }
 
     pub(crate) fn sanitize(&self, value: &mut Value) {
-        self.walk(value, MAX_DEPTH);
+        self.walk(value, MAX_DEPTH, true);
     }
 
     pub(crate) fn sanitize_shallow(&self, value: &mut Value) {
-        self.walk(value, 1);
+        self.walk(value, 1, true);
     }
 
-    fn walk(&self, value: &mut Value, depth_left: usize) {
+    /// Depth capping, string truncation, and UTF-8 boundary safety **without**
+    /// key redaction — the events pipeline's rule (spec decision 5). Every field
+    /// in an event was written by hand, so silently replacing a legitimately
+    /// named one would corrupt analytics with no error to show for it.
+    pub(crate) fn sanitize_structural(&self, value: &mut Value) {
+        self.walk(value, MAX_DEPTH, false);
+    }
+
+    fn walk(&self, value: &mut Value, depth_left: usize, redact: bool) {
         match value {
             Value::String(s) => truncate_string(s),
             Value::Object(map) => {
                 for (key, val) in map.iter_mut() {
-                    if self.filter_keys.iter().any(|f| key.to_lowercase() == *f) {
+                    if redact && self.filter_keys.iter().any(|f| key.to_lowercase() == *f) {
                         *val = Value::String(FILTERED.into());
                     } else if depth_left <= 1 && (val.is_object() || val.is_array()) {
                         *val = Value::String(DEPTH_MARKER.into());
                     } else {
-                        self.walk(val, depth_left - 1);
+                        self.walk(val, depth_left - 1, redact);
                     }
                 }
             }
@@ -53,7 +61,7 @@ impl Sanitizer {
                     if depth_left <= 1 && (val.is_object() || val.is_array()) {
                         *val = Value::String(DEPTH_MARKER.into());
                     } else {
-                        self.walk(val, depth_left - 1);
+                        self.walk(val, depth_left - 1, redact);
                     }
                 }
             }
@@ -111,6 +119,30 @@ mod tests {
         let mut v = json!({"a": {"b": 1}, "c": "keep"});
         sanitizer().sanitize_shallow(&mut v);
         assert_eq!(v, json!({"a": "[DEPTH]", "c": "keep"}));
+    }
+
+    #[test]
+    fn test_structural_keeps_filtered_keys_but_still_caps_and_truncates() {
+        let mut v = json!({
+            "password": "hunter2",
+            "msg": "y".repeat(MAX_STRING_BYTES + 10),
+        });
+        sanitizer().sanitize_structural(&mut v);
+        assert_eq!(
+            v["password"],
+            json!("hunter2"),
+            "events are not key-redacted"
+        );
+        assert!(v["msg"].as_str().unwrap().ends_with(TRUNCATED));
+
+        let mut deep = json!("leaf");
+        for _ in 0..(MAX_DEPTH + 2) {
+            deep = json!({ "k": deep });
+        }
+        sanitizer().sanitize_structural(&mut deep);
+        let s = serde_json::to_string(&deep).unwrap();
+        assert!(s.contains(DEPTH_MARKER));
+        assert!(!s.contains("leaf"));
     }
 
     #[test]

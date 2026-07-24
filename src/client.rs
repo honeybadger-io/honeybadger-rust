@@ -1,7 +1,10 @@
 //! Client: shared state + the notify pipeline (spec "Notify pipeline").
 use crate::breadcrumbs::{Breadcrumb, RingBuffer};
 use crate::config::Config;
+use crate::drops::DropCounter;
 use crate::error::Error;
+use crate::event::{Sampler, assemble as assemble_event};
+use crate::events_worker::{EventsConfig, EventsWorkerHandle};
 use crate::notice::{Notice, assemble};
 use crate::sanitizer::Sanitizer;
 use crate::transport::{
@@ -11,11 +14,21 @@ use crate::worker::WorkerHandle;
 use serde_json::{Map, Value};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Serialized-JSON ceiling, matching the Reporting API's documented maximum. Measured
 /// before compression: the service applies the limit to the decompressed body.
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 262_144;
+
+/// Events-worker lifecycle. `Once` cannot express this: a worker must never be
+/// created after shutdown, which means the state has to be checked and changed
+/// under one lock.
+enum EventsState {
+    NotStarted,
+    Running(EventsWorkerHandle),
+    Stopped,
+    Failed,
+}
 
 struct Inner {
     config: Config,
@@ -24,6 +37,12 @@ struct Inner {
     breadcrumbs: Mutex<RingBuffer>,
     transport: Arc<dyn Transport>,
     worker: WorkerHandle,
+    notice_drops: Arc<DropCounter>,
+    event_context: Mutex<Map<String, Value>>,
+    request_id: Mutex<Option<String>>,
+    events: Mutex<EventsState>,
+    event_drops: Arc<DropCounter>,
+    sampler: Sampler,
 }
 
 /// A configured Honeybadger reporter. Cheap to clone; all clones share one worker.
@@ -72,10 +91,10 @@ impl Client {
     /// Reports a notice built by hand. See [`Notice::from_error`] and
     /// [`Notice::message`].
     pub fn notify_notice(&self, notice: Notice) {
-        if let Some(payload) = self.run_pipeline(notice) {
-            if !self.0.worker.try_enqueue(payload) {
-                log::warn!("honeybadger: notice dropped (queue full or worker stopped)");
-            }
+        if let Some(payload) = self.run_pipeline(notice)
+            && !self.0.worker.try_enqueue(payload)
+        {
+            self.0.notice_drops.record();
         }
     }
 
@@ -110,6 +129,7 @@ impl Client {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         notice.merge_scope_context(scope);
+        let request_id_fallback = self.current_request_id();
         let breadcrumbs = inner.config.breadcrumbs_enabled.then(|| {
             inner
                 .breadcrumbs
@@ -136,13 +156,17 @@ impl Client {
             return None;
         }
 
-        // 3. before_notify hooks; panics caught and treated as pass.
+        // 3. before_notify hooks; panics caught and treated as pass. The guard
+        //    stops our own panic hook from reporting a panic we are containing.
         for hook in &inner.config.before_notify {
             let hook = hook.clone();
-            let keep = catch_unwind(AssertUnwindSafe(|| hook(&mut notice))).unwrap_or_else(|_| {
-                log::warn!("honeybadger: before_notify hook panicked; continuing");
-                true
-            });
+            let keep = {
+                let _suppressed = crate::panic_hook::suppress_reporting();
+                catch_unwind(AssertUnwindSafe(|| hook(&mut notice))).unwrap_or_else(|_| {
+                    log::warn!("honeybadger: before_notify hook panicked; continuing");
+                    true
+                })
+            };
             if !keep {
                 return None;
             }
@@ -185,6 +209,7 @@ impl Client {
             breadcrumbs,
             frames,
             std::process::id(),
+            request_id_fallback.as_deref(),
         );
         let bytes = match serde_json::to_vec(&payload) {
             Ok(b) => b,
@@ -229,8 +254,8 @@ impl Client {
         }
     }
 
-    /// Clears this client's context **and** its breadcrumb trail — the whole accumulated
-    /// diagnostic scope.
+    /// Clears this client's context, its breadcrumb trail, its event context, and its
+    /// request id — the whole accumulated diagnostic scope.
     ///
     /// The scope is shared process-wide, so this discards what every other in-flight
     /// caller has accumulated too. It suits programs that handle one unit of work at a
@@ -247,6 +272,8 @@ impl Client {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        self.clear_event_context();
+        self.clear_request_id();
     }
 
     /// Records a breadcrumb. The most recent 40 are attached to each notice; older ones
@@ -271,16 +298,207 @@ impl Client {
             .push(Breadcrumb::new(message, category, metadata));
     }
 
-    /// Blocks until every notice queued so far has been attempted, or `timeout` expires.
-    /// Returns whether the barrier completed in time.
+    /// Blocks until everything enqueued so far on **both** pipelines has been
+    /// attempted, or `timeout` expires. Returns whether the barrier completed.
+    ///
+    /// Both flushes start before either is waited on, so the timeout is the
+    /// number you passed rather than twice it. An events pipeline that was
+    /// never started flushes as a no-op success.
+    ///
+    /// `false` means some of it did not go out: the timeout expired, or a batch
+    /// is being retried and everything behind it is waiting its turn. It is not
+    /// an error — delivery continues — but it is not a delivery receipt either.
     pub fn flush(&self, timeout: Duration) -> bool {
-        self.0.worker.flush(timeout)
+        // `None` means the timeout is not representable as an instant — the SDK
+        // must not panic on a caller's `Duration::MAX`, so wait without one.
+        let deadline = Instant::now().checked_add(timeout);
+        let notices = self.0.worker.flush_begin();
+        let events = {
+            let state = self.0.events.lock().unwrap_or_else(|e| e.into_inner());
+            match &*state {
+                EventsState::Running(handle) => handle.flush_begin(),
+                _ => None, // never spawn a worker in order to flush it
+            }
+        };
+
+        let wait = |rx: crossbeam_channel::Receiver<bool>| match deadline {
+            Some(deadline) => rx.recv_deadline(deadline).unwrap_or(false),
+            None => rx.recv().unwrap_or(false),
+        };
+        let notices_ok = notices.map(&wait).unwrap_or(false);
+        let events_ok = events.map(&wait).unwrap_or(true);
+        notices_ok && events_ok
     }
 
-    /// Stops the delivery thread, giving queued notices up to `timeout` to drain. The
-    /// client accepts no further notices afterwards.
+    /// Stops both delivery threads, giving queued work up to `timeout` to
+    /// drain. The client accepts nothing further afterwards.
     pub fn shutdown(&self, timeout: Duration) {
+        // Mark Stopped before touching the worker, so a concurrent event() can
+        // never spawn one behind our back.
+        let previous = {
+            let mut state = self.0.events.lock().unwrap_or_else(|e| e.into_inner());
+            std::mem::replace(&mut *state, EventsState::Stopped)
+        };
+        if let EventsState::Running(handle) = previous {
+            handle.shutdown(timeout);
+        }
         self.0.worker.shutdown(timeout);
+    }
+
+    /// Sends an Insights event. `event_type` always wins over any `event_type`
+    /// key in `payload`.
+    ///
+    /// The payload must be a JSON **object**; anything else is logged and
+    /// dropped. Fire-and-forget: assembly happens on your thread, delivery does
+    /// not. To send a struct, convert it explicitly with
+    /// [`serde_json::to_value`] — that conversion is deliberately visible,
+    /// because it is the one way an event can carry a field nobody enumerated.
+    pub fn event(&self, event_type: &str, payload: Value) {
+        self.enqueue_event(Some(event_type), payload);
+    }
+
+    /// Sends an Insights event whose `event_type` is already in the payload.
+    /// An event without a non-empty string `event_type` is dropped.
+    pub fn event_value(&self, payload: Value) {
+        self.enqueue_event(None, payload);
+    }
+
+    fn enqueue_event(&self, event_type: Option<&str>, payload: Value) {
+        let inner = &*self.0;
+        if !inner.config.events_enabled {
+            return;
+        }
+        let scope = inner
+            .event_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let request_id = self.current_request_id();
+        let Some(line) = assemble_event(
+            event_type,
+            payload,
+            &scope,
+            request_id.as_deref(),
+            &inner.config,
+            &inner.sanitizer,
+            &inner.sampler,
+        ) else {
+            return;
+        };
+        let enqueued = self
+            .with_events_worker(|handle| handle.try_enqueue(line))
+            .unwrap_or(false);
+        if !enqueued {
+            inner.event_drops.record();
+        }
+    }
+
+    /// Runs `f` against the events worker, spawning it if this is the first
+    /// event. Returns None when no worker exists or may be created.
+    fn with_events_worker<R>(&self, f: impl FnOnce(&EventsWorkerHandle) -> R) -> Option<R> {
+        let inner = &*self.0;
+        let mut state = inner.events.lock().unwrap_or_else(|e| e.into_inner());
+
+        // A forked child inherits channel state but no thread; enqueueing into
+        // it would silently discard events and a flush would wait out its whole
+        // timeout for an acknowledgement that can never arrive.
+        if let EventsState::Running(handle) = &*state
+            && handle.pid != std::process::id()
+        {
+            log::warn!("honeybadger: events worker did not survive fork; restarting");
+            *state = EventsState::NotStarted;
+        }
+
+        if matches!(*state, EventsState::NotStarted) {
+            let cfg = EventsConfig {
+                batch_size: inner.config.events_batch_size,
+                flush_interval: inner.config.events_flush_interval,
+                queue_size: inner.config.events_queue_size,
+                max_retries: inner.config.events_max_retries,
+                suspend_interval: Duration::from_secs(3600),
+            };
+            match crate::events_worker::spawn(
+                inner.transport.clone(),
+                cfg,
+                inner.event_drops.clone(),
+            ) {
+                Ok(handle) => *state = EventsState::Running(handle),
+                Err(e) => {
+                    log::error!(
+                        "honeybadger: could not start the events worker; events are disabled for this process: {e}"
+                    );
+                    *state = EventsState::Failed;
+                }
+            }
+        }
+
+        match &*state {
+            EventsState::Running(handle) => Some(f(handle)),
+            _ => None,
+        }
+    }
+
+    /// Merges key/value pairs into this client's **event** context, attached to
+    /// every later event. Setting a key to [`serde_json::Value::Null`] removes it.
+    ///
+    /// **Shared by every thread and task using this client — it is not
+    /// request-scoped.** Concurrent requests overwrite each other here. Use it
+    /// for process-wide facts and put per-request data in the event payload,
+    /// where it travels with the event and cannot be clobbered.
+    pub fn event_context<I, K>(&self, entries: I)
+    where
+        I: IntoIterator<Item = (K, Value)>,
+        K: Into<String>,
+    {
+        let mut ctx = self
+            .0
+            .event_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (k, v) in entries {
+            let key = k.into();
+            if v.is_null() {
+                ctx.remove(&key);
+            } else {
+                ctx.insert(key, v);
+            }
+        }
+    }
+
+    /// Clears this client's event context, leaving notice context untouched.
+    pub fn clear_event_context(&self) {
+        self.0
+            .event_context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+    }
+
+    /// Sets the request id correlating this client's notices and events, and
+    /// driving deterministic sampling — every event sharing an id shares one
+    /// sampling decision.
+    ///
+    /// **This slot is process-wide, exactly like [`Client::context`].** The name
+    /// describes what you put in it, not a scoping guarantee. Under concurrency
+    /// one request's id overwrites another's, so an event can be attributed
+    /// *and sampled* as the wrong request. Use it in programs that handle one
+    /// unit of work at a time — a CLI, a cron job, a serialized consumer — and
+    /// in a concurrent server put `request_id` in the event payload instead.
+    pub fn request_id(&self, id: impl Into<String>) {
+        *self.0.request_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.into());
+    }
+
+    /// Clears the request id set by [`Client::request_id`].
+    pub fn clear_request_id(&self) {
+        *self.0.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    pub(crate) fn current_request_id(&self) -> Option<String> {
+        self.0
+            .request_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     pub(crate) fn wants_panic_hook(&self) -> bool {
@@ -322,9 +540,15 @@ impl ClientBuilder {
                 Arc::new(NullTransport)
             }
         };
-        let worker = crate::worker::spawn(transport.clone(), config.notice_queue_size)
-            .map_err(Error::WorkerSpawn)?;
+        let notice_drops = Arc::new(DropCounter::new("notices"));
+        let worker = crate::worker::spawn(
+            transport.clone(),
+            config.notice_queue_size,
+            notice_drops.clone(),
+        )
+        .map_err(Error::WorkerSpawn)?;
         let sanitizer = Sanitizer::new(config.filter_keys.iter());
+        let sampler = Sampler::new(config.events_sample_rate);
         Ok(Client(Arc::new(Inner {
             config,
             sanitizer,
@@ -332,6 +556,12 @@ impl ClientBuilder {
             breadcrumbs: Mutex::new(RingBuffer::new()),
             transport,
             worker,
+            notice_drops,
+            event_context: Mutex::new(Map::new()),
+            request_id: Mutex::new(None),
+            events: Mutex::new(EventsState::NotStarted),
+            event_drops: Arc::new(DropCounter::new("events")),
+            sampler,
         })))
     }
 }
@@ -370,6 +600,7 @@ mod tests {
         transport
             .requests()
             .iter()
+            .filter(|r| r.kind == crate::RequestKind::Notices)
             .map(|r| {
                 let mut s = String::new();
                 flate2::read::ZlibDecoder::new(&r.body[..])
@@ -378,6 +609,240 @@ mod tests {
                 serde_json::from_str(&s).unwrap()
             })
             .collect()
+    }
+
+    fn events_delivered(transport: &TestTransport) -> Vec<serde_json::Value> {
+        transport
+            .requests()
+            .iter()
+            .filter(|r| r.kind == crate::RequestKind::Events)
+            .flat_map(|r| {
+                let mut s = String::new();
+                flate2::read::ZlibDecoder::new(&r.body[..])
+                    .read_to_string(&mut s)
+                    .unwrap();
+                s.lines()
+                    .map(|l| serde_json::from_str(l).unwrap())
+                    .collect::<Vec<serde_json::Value>>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_event_delivers_with_context_and_request_id() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event_context([("tenant", json!("acme"))]);
+        client.request_id("req-9");
+        client.event("user.created", json!({ "user_id": 7 }));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event_type"], json!("user.created"));
+        assert_eq!(events[0]["user_id"], json!(7));
+        assert_eq!(events[0]["tenant"], json!("acme"));
+        assert_eq!(events[0]["request_id"], json!("req-9"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_event_value_and_batching_share_one_request() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        for i in 0..5 {
+            client.event_value(json!({ "event_type": "tick", "n": i }));
+        }
+        assert!(client.flush(Duration::from_secs(5)));
+        assert_eq!(events_delivered(&transport).len(), 5);
+        assert_eq!(
+            transport
+                .requests()
+                .iter()
+                .filter(|r| r.kind == crate::RequestKind::Events)
+                .count(),
+            1,
+            "a flush cuts one batch, not five requests"
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_flush_covers_both_pipelines_in_one_timeout() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.notify_notice(crate::Notice::message("X", "y"));
+        client.event("t", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+        assert_eq!(delivered(&transport).len(), 1, "the notice went out");
+        assert_eq!(events_delivered(&transport).len(), 1, "the event went out");
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_flush_succeeds_when_the_events_worker_was_never_spawned() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.notify_notice(crate::Notice::message("X", "y"));
+        assert!(
+            client.flush(Duration::from_secs(5)),
+            "an unspawned events pipeline must flush as a no-op success"
+        );
+        assert!(
+            transport
+                .requests()
+                .iter()
+                .all(|r| r.kind == crate::RequestKind::Notices),
+            "flushing must never spawn the worker it is flushing"
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_event_after_shutdown_never_spawns_a_worker() {
+        // The race Once cannot close: one clone shuts down, another then calls
+        // event() and would otherwise spawn a worker nobody will ever stop.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        let clone = client.clone();
+        client.shutdown(Duration::from_secs(5));
+        clone.event("t", json!({}));
+        assert!(
+            events_delivered(&transport).is_empty(),
+            "no events pipeline may be created after shutdown"
+        );
+    }
+
+    #[test]
+    fn test_a_worker_that_did_not_survive_fork_is_replaced() {
+        // Forking under the test harness is hostile, so inject the recorded PID
+        // instead: a child inherits the channel but not the thread, so without
+        // this check events would vanish and flush would wait out its whole
+        // timeout for an acknowledgement that can never arrive.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event("before.fork", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        {
+            let mut state = client.0.events.lock().unwrap();
+            match &mut *state {
+                EventsState::Running(handle) => handle.pid = handle.pid.wrapping_add(1),
+                _ => panic!("the first event must have started a worker"),
+            }
+        }
+
+        client.event("after.fork", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+        {
+            let state = client.0.events.lock().unwrap();
+            match &*state {
+                EventsState::Running(handle) => assert_eq!(
+                    handle.pid,
+                    std::process::id(),
+                    "a replacement worker must record the live PID"
+                ),
+                _ => panic!("the PID mismatch must respawn, not disable the pipeline"),
+            }
+        }
+        let types: Vec<serde_json::Value> = events_delivered(&transport)
+            .iter()
+            .map(|e| e["event_type"].clone())
+            .collect();
+        assert_eq!(types, vec![json!("before.fork"), json!("after.fork")]);
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_events_disabled_never_spawns() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client_with(transport.clone(), |b| b.events_enabled(false));
+        client.event("t", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+        assert!(events_delivered(&transport).is_empty());
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_concurrent_events_during_a_flush_neither_deadlock_nor_lose_acks() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        let mut threads = Vec::new();
+        for t in 0..4 {
+            let client = client.clone();
+            threads.push(std::thread::spawn(move || {
+                for i in 0..50 {
+                    client.event("load", json!({ "t": t, "i": i }));
+                }
+            }));
+        }
+        // Flush repeatedly while producers are still running. Each must return
+        // within its own timeout rather than blocking behind the producers.
+        for _ in 0..5 {
+            assert!(
+                client.flush(Duration::from_secs(10)),
+                "a flush must acknowledge even under concurrent production"
+            );
+        }
+        for t in threads {
+            t.join().unwrap();
+        }
+        assert!(client.flush(Duration::from_secs(10)));
+        assert_eq!(
+            events_delivered(&transport).len(),
+            200,
+            "no event may be lost when flushes interleave with producers"
+        );
+        client.shutdown(Duration::from_secs(10));
+    }
+
+    #[test]
+    fn test_flush_with_an_unrepresentable_timeout_does_not_panic() {
+        // `Instant::now() + Duration::MAX` panics, and the SDK promises never to
+        // panic on a caller's input.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event("t", json!({}));
+        assert!(client.flush(Duration::MAX));
+        assert_eq!(events_delivered(&transport).len(), 1);
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_request_id_slot_correlates_notices_with_events() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.request_id("req-42");
+        client.notify_notice(crate::Notice::message("X", "y"));
+        client.event("t", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        assert_eq!(
+            delivered(&transport)[0]["correlation_context"]["request_id"],
+            json!("req-42")
+        );
+        assert_eq!(
+            events_delivered(&transport)[0]["request_id"],
+            json!("req-42")
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_clear_context_clears_the_whole_scope() {
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.context([("a", json!(1))]);
+        client.event_context([("b", json!(2))]);
+        client.request_id("req-1");
+        client.clear_context();
+
+        client.event("t", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+        let events = events_delivered(&transport);
+        assert_eq!(events[0].get("b"), None, "event context cleared");
+        assert_eq!(events[0].get("request_id"), None, "request id cleared");
+        client.shutdown(Duration::from_secs(5));
     }
 
     #[test]
@@ -564,6 +1029,24 @@ mod tests {
             .unwrap();
         // deliver_now runs inside the panic hook; it must swallow the transport panic.
         client.deliver_now(crate::Notice::message("panic", "argh"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_queue_full_drops_are_counted_not_logged_individually() {
+        // Suspend the worker with a 402 so it stops consuming, then overfill.
+        let transport = Arc::new(TestTransport::new());
+        transport.respond_with(402);
+        let client = test_client_with(transport.clone(), |b| b.notice_queue_size(2));
+        client.notify_notice(crate::Notice::message("X", "y")); // consumed -> suspends
+        std::thread::sleep(Duration::from_millis(200));
+        for _ in 0..20 {
+            client.notify_notice(crate::Notice::message("X", "y"));
+        }
+        assert!(
+            client.0.notice_drops.pending() > 0,
+            "overflow must be accumulated in the counter"
+        );
         client.shutdown(Duration::from_secs(5));
     }
 

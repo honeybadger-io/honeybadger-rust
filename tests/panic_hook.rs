@@ -10,6 +10,15 @@ fn spawn_fixture(cmd: &mut Command, endpoint: &str) -> std::process::Output {
         .expect("fixture ran")
 }
 
+/// Runs an `examples/` fixture, supplying the endpoint both as `HONEYBADGER_ENDPOINT`
+/// and as argv[1] so fixtures can read it whichever way suits them.
+fn run_fixture(name: &str, endpoint: &str) -> std::process::Output {
+    spawn_fixture(
+        Command::new(env!("CARGO")).args(["run", "--quiet", "--example", name, "--", endpoint]),
+        endpoint,
+    )
+}
+
 #[test]
 fn test_unwind_panic_reports_before_exit() {
     let mut server = mockito::Server::new();
@@ -28,14 +37,25 @@ fn test_unwind_panic_reports_before_exit() {
         .expect(1)
         .create();
 
-    let out = spawn_fixture(
-        Command::new(env!("CARGO")).args(["run", "--quiet", "--example", "panic_fixture"]),
-        &server.url(),
-    );
+    let out = run_fixture("panic_fixture", &server.url());
     assert!(
         !out.status.success(),
         "fixture must exit nonzero after panic"
     );
+    mock.assert();
+}
+
+#[test]
+fn test_panicking_before_notify_hook_reports_no_panic_notice() {
+    let mut server = mockito::Server::new();
+    let mock = server
+        .mock("POST", "/v1/notices")
+        .with_status(201)
+        .expect(1) // exactly one: the notice itself, never a panic notice
+        .create();
+
+    run_fixture("hook_panic_fixture", &server.url());
+
     mock.assert();
 }
 

@@ -68,6 +68,34 @@
 //! rather than the process — arrives with the planned `tracing` layer and tower/axum
 //! middleware. Until then, the rule above is the whole story.
 //!
+//! # Insights events
+//!
+//! Beyond errors, the SDK sends structured events to
+//! [Honeybadger Insights](https://www.honeybadger.io/insights/):
+//!
+//! ```rust,no_run
+//! use serde_json::json;
+//!
+//! honeybadger::event("user.created", json!({ "user_id": 7, "plan": "pro" }));
+//! ```
+//!
+//! Events batch in the background — 1000 of them, 30 seconds, or 4.5 MB,
+//! whichever comes first — and the worker thread starts on your first
+//! [`event`] call, so a program that only reports errors never pays for it.
+//! [`flush`] covers events and notices together.
+//!
+//! The payload is a [`serde_json::Value`] rather than anything `Serialize`.
+//! That is deliberate: passing a struct would send every field it happens to
+//! carry, so a struct must be converted explicitly with
+//! [`serde_json::to_value`]. Because every field is written by hand,
+//! `filter_keys` redaction does **not** apply to events the way it does to
+//! notice context.
+//!
+//! Set [`request_id`] to correlate an error with the events around it. It also
+//! drives sampling: events sharing a request id share one decision, so a
+//! sampled request keeps all of its events or none. Like [`context`], the slot
+//! is process-wide — see the warning above.
+//!
 //! # Panics
 //!
 //! The SDK does not panic, and it contains panics from the code you give it: a
@@ -87,7 +115,10 @@ mod breadcrumbs;
 mod bt;
 mod client;
 mod config;
+mod drops;
 mod error;
+mod event;
+mod events_worker;
 mod global;
 mod notice;
 mod panic_hook;
@@ -100,7 +131,8 @@ pub use crate::client::{Client, ClientBuilder};
 pub use crate::config::{Config, ConfigBuilder};
 pub use crate::error::Error;
 pub use crate::global::{
-    Guard, add_breadcrumb, clear_context, context, flush, init, notify, notify_notice,
+    Guard, add_breadcrumb, clear_context, clear_event_context, clear_request_id, context, event,
+    event_context, event_value, flush, init, notify, notify_notice, request_id,
 };
 pub use crate::notice::Notice;
 pub use crate::transport::{

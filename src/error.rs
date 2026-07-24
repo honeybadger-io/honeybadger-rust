@@ -29,6 +29,11 @@ pub enum Error {
     /// The OS refused to spawn the background delivery thread.
     #[error("failed to spawn the honeybadger worker thread")]
     WorkerSpawn(#[source] std::io::Error),
+
+    /// A configuration value was present but unusable — out of range, or an
+    /// environment variable that could not be parsed.
+    #[error("invalid Honeybadger configuration: {0}")]
+    InvalidConfig(String),
 }
 
 #[cfg(test)]

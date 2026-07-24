@@ -6,6 +6,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub(crate) const NOTICES_PATH: &str = "/v1/notices";
+pub(crate) const EVENTS_PATH: &str = "/v1/events";
 
 /// Which Honeybadger API a request targets.
 #[non_exhaustive]
@@ -13,6 +14,8 @@ pub(crate) const NOTICES_PATH: &str = "/v1/notices";
 pub enum RequestKind {
     /// The error-reporting API, `POST /v1/notices`.
     Notices,
+    /// The Insights events API, `POST /v1/events`.
+    Events,
 }
 
 /// One outbound request. Construct via [`TransportRequest::notices`].
@@ -40,6 +43,18 @@ impl<'a> TransportRequest<'a> {
             content_type: "application/json",
             body,
             urgent,
+        }
+    }
+
+    /// Builds a request against the Insights events API. The body is a batch of
+    /// newline-delimited JSON objects, deflated like every other request.
+    pub fn events(body: &'a [u8]) -> Self {
+        TransportRequest {
+            kind: RequestKind::Events,
+            path: EVENTS_PATH,
+            content_type: "application/x-ndjson",
+            body,
+            urgent: false,
         }
     }
 }
@@ -164,7 +179,10 @@ impl Transport for NullTransport {
 // ---------- Test ----------
 
 /// A request captured by [`TestTransport`].
+#[non_exhaustive]
 pub struct CapturedRequest {
+    /// Which API the request targeted.
+    pub kind: RequestKind,
     /// Path the request was sent to.
     pub path: String,
     /// Content type of the body.
@@ -201,6 +219,7 @@ impl TestTransport {
         let lock = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         lock.iter()
             .map(|r| CapturedRequest {
+                kind: r.kind,
                 path: r.path.clone(),
                 content_type: r.content_type.clone(),
                 body: r.body.clone(),
@@ -216,6 +235,7 @@ impl Transport for TestTransport {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(CapturedRequest {
+                kind: req.kind,
                 path: req.path.to_owned(),
                 content_type: req.content_type.to_owned(),
                 body: req.body.to_vec(),
@@ -301,6 +321,47 @@ mod tests {
             t.deliver(&TransportRequest::notices(&body, false)).unwrap(),
             429
         );
+    }
+
+    #[test]
+    fn test_events_request_shape() {
+        let body = compress(b"{\"a\":1}\n{\"b\":2}");
+        let req = TransportRequest::events(&body);
+        assert_eq!(req.kind, RequestKind::Events);
+        assert_eq!(req.path, "/v1/events");
+        assert_eq!(req.content_type, "application/x-ndjson");
+        assert!(!req.urgent, "events are never delivered on the urgent path");
+    }
+
+    #[test]
+    fn test_test_transport_records_kind() {
+        let t = TestTransport::new();
+        let body = compress(b"{}");
+        t.deliver(&TransportRequest::notices(&body, false)).unwrap();
+        t.deliver(&TransportRequest::events(&body)).unwrap();
+        let kinds: Vec<RequestKind> = t.requests().iter().map(|r| r.kind).collect();
+        assert_eq!(kinds, vec![RequestKind::Notices, RequestKind::Events]);
+    }
+
+    #[test]
+    fn test_server_transport_posts_ndjson_to_events() {
+        let mut server = mockito::Server::new();
+        let mock = server
+            .mock("POST", "/v1/events")
+            .match_header("X-API-Key", "test-key")
+            .match_header("Content-Type", "application/x-ndjson")
+            .match_header("Content-Encoding", "deflate")
+            .with_status(201)
+            .create();
+        let t = ServerTransport::new(
+            server.url(),
+            "test-key".into(),
+            std::time::Duration::from_secs(2),
+            std::time::Duration::from_secs(5),
+        );
+        let body = compress(b"{\"event_type\":\"x\"}");
+        assert_eq!(t.deliver(&TransportRequest::events(&body)).unwrap(), 201);
+        mock.assert();
     }
 
     #[test]

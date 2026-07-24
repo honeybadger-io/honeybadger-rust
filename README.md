@@ -81,6 +81,72 @@ Configuration is env-var friendly: `HONEYBADGER_API_KEY`, `HONEYBADGER_ENV`,
 
 Development and test environments don't report by default (`exclude_envs`).
 
+## Insights events
+
+Beyond errors, the SDK sends structured events to
+[Honeybadger Insights](https://www.honeybadger.io/insights/):
+
+```rust
+use serde_json::json;
+
+honeybadger::event("user.created", json!({ "user_id": 7, "plan": "pro" }));
+
+// The event_type can live in the payload instead:
+honeybadger::event_value(json!({ "event_type": "job.finished", "ms": 91 }));
+```
+
+Events batch in the background and go out when the first of three triggers fires:
+1000 events, 30 seconds, or 4.5 MB. The worker thread starts on your first `event()`
+call, so a program that only reports errors never pays for it. `honeybadger::flush()`
+covers events and notices together, within one timeout.
+
+The payload is a `serde_json::Value`, not `impl Serialize`. That is deliberate:
+passing a struct would send every field it happens to carry, including ones nobody
+enumerated, so a struct is converted explicitly at the call site:
+
+```rust
+honeybadger::event("user.created", serde_json::to_value(&user)?);
+```
+
+Because every field in an event is written by hand, `filter_keys` redaction does **not**
+apply to events the way it does to notice context. Depth capping, string truncation,
+and the 100 kB per-event ceiling still do; an oversized event is logged and dropped.
+
+### Correlation and sampling
+
+```rust
+honeybadger::request_id("req-9");                        // correlates notices and events
+honeybadger::event_context([("service", json!("checkout"))]); // added to every later event
+```
+
+`request_id` also drives sampling: events sharing a request id share one decision, so a
+sampled request keeps all of its events or none. Like `context`, both the event context
+and the request-id slot are **process-wide** — in a concurrent server, put `request_id`
+in the event payload instead, where it travels with the event and cannot be clobbered.
+
+### Configuration
+
+| Option | Env | Default |
+| --- | --- | --- |
+| `events_enabled` | `HONEYBADGER_EVENTS_ENABLED` | `true` |
+| `events_batch_size` | `HONEYBADGER_EVENTS_BATCH_SIZE` | `1000` |
+| `events_flush_interval` | `HONEYBADGER_EVENTS_FLUSH_INTERVAL` (seconds) | `30s` |
+| `events_queue_size` | `HONEYBADGER_EVENTS_QUEUE_SIZE` | `10000` |
+| `events_max_retries` | `HONEYBADGER_EVENTS_MAX_RETRIES` | `3` |
+| `events_sample_rate` | `HONEYBADGER_EVENTS_SAMPLE_RATE` | `100` |
+| `events_attach_hostname` | `HONEYBADGER_EVENTS_ATTACH_HOSTNAME` | `true` |
+| `events_attach_environment` | `HONEYBADGER_EVENTS_ATTACH_ENVIRONMENT` | `true` |
+| `before_event` | — | none |
+
+`events_queue_size` bounds everything outstanding at once — queued, batching, and
+awaiting retry — rather than just the channel. Past that limit the oldest retained
+batch is shed first, so a rate-limited endpoint cannot stall the pipeline.
+
+`before_event` hooks mirror `before_notify`: they run in registration order against
+the assembled event, may mutate it freely, and returning `false` drops it.
+
+See `examples/events.rs` for a runnable version.
+
 ## License
 
 MIT

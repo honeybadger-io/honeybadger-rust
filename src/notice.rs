@@ -210,6 +210,7 @@ pub(crate) fn assemble(
     breadcrumbs: Option<Vec<Breadcrumb>>,
     frames: Option<Vec<Frame>>,
     pid: u32,
+    request_id_fallback: Option<&str>,
 ) -> Value {
     let backtrace: Vec<Value> = frames
         .unwrap_or_default()
@@ -270,7 +271,14 @@ pub(crate) fn assemble(
     );
     payload.insert("request".into(), json!({ "context": notice.context }));
     payload.insert("server".into(), Value::Object(server));
-    if let Some(request_id) = notice.context.get("request_id") {
+    // Merged notice context stays authoritative; the client's process-wide slot
+    // only fills the gap when the notice carries no request_id of its own.
+    if let Some(request_id) = notice
+        .context
+        .get("request_id")
+        .cloned()
+        .or_else(|| request_id_fallback.map(|id| Value::String(id.to_owned())))
+    {
         payload.insert(
             "correlation_context".into(),
             json!({ "request_id": request_id }),
@@ -435,7 +443,14 @@ mod tests {
             method: Some("my_app::run".into()),
             source: None,
         }];
-        let payload = assemble(&notice, &test_config(), Some(crumbs), Some(frames), 12345);
+        let payload = assemble(
+            &notice,
+            &test_config(),
+            Some(crumbs),
+            Some(frames),
+            12345,
+            None,
+        );
         assert_eq!(
             payload,
             json!({
@@ -481,7 +496,7 @@ mod tests {
             .hostname("h")
             .build()
             .unwrap();
-        let payload = assemble(&Notice::message("X", "y"), &cfg, None, None, 1);
+        let payload = assemble(&Notice::message("X", "y"), &cfg, None, None, 1, None);
         assert_eq!(payload["server"].get("environment_name"), None);
         assert_eq!(payload["server"].get("revision"), None);
         assert_eq!(payload["error"]["fingerprint"], json!(null));
@@ -491,6 +506,43 @@ mod tests {
             json!({"enabled": true, "trail": []})
         );
         assert_eq!(payload["error"]["backtrace"], json!([]));
+    }
+
+    #[test]
+    fn test_notice_context_request_id_still_wins() {
+        let notice = Notice::message("X", "y").context([("request_id", json!("from-notice"))]);
+        let payload = assemble(&notice, &test_config(), None, None, 1, Some("from-slot"));
+        assert_eq!(
+            payload["correlation_context"]["request_id"],
+            json!("from-notice"),
+            "merged notice context remains authoritative"
+        );
+    }
+
+    #[test]
+    fn test_slot_is_used_only_as_a_fallback() {
+        let payload = assemble(
+            &Notice::message("X", "y"),
+            &test_config(),
+            None,
+            None,
+            1,
+            Some("from-slot"),
+        );
+        assert_eq!(
+            payload["correlation_context"]["request_id"],
+            json!("from-slot")
+        );
+
+        let payload = assemble(
+            &Notice::message("X", "y"),
+            &test_config(),
+            None,
+            None,
+            1,
+            None,
+        );
+        assert_eq!(payload.get("correlation_context"), None);
     }
 
     #[test]
