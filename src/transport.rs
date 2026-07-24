@@ -29,8 +29,8 @@ pub struct TransportRequest<'a> {
     pub content_type: &'a str,
     /// Request body, already zlib-deflated. Send it with `Content-Encoding: deflate`.
     pub body: &'a [u8],
-    /// Set for panic notices, delivered synchronously while the process is dying. Use
-    /// short timeouts and don't retry.
+    /// Set for panic notices, delivered synchronously while the process is dying.
+    /// One shot: don't retry, and bound the wait — the caller is on its way out.
     pub urgent: bool,
 }
 
@@ -170,6 +170,26 @@ pub(crate) struct ServerTransport {
     user_agent: String,
 }
 
+/// Timeouts for the panic path, derived from the configured ones.
+///
+/// The urgent path gets one shot with no retry behind it, on the highest-value
+/// notice a process sends, so it is not where to economize — by default it gets
+/// the whole normal budget. Two bounds apply. It never waits longer than a normal
+/// request was allowed, because a caller who tightened `request_timeout` did not
+/// ask for a longer hang on panic than on a healthy send. And it never waits
+/// longer than five seconds, because background delivery may take thirty and a
+/// crash may not: the process is on its way out and something is likely waiting
+/// to restart it.
+///
+/// Returns `(connect, total)`. Connect is clamped to the total it must fit inside.
+fn urgent_budget(connect: Duration, request: Duration) -> (Duration, Duration) {
+    let total = request.min(URGENT_MAX_TOTAL);
+    (connect.min(total), total)
+}
+
+/// Ceiling on how long a panic may hang waiting for its notice to land.
+const URGENT_MAX_TOTAL: Duration = Duration::from_secs(5);
+
 fn build_agent(connect: Duration, total: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(connect))
@@ -190,7 +210,10 @@ impl ServerTransport {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_key,
             agent: build_agent(connect, request),
-            urgent_agent: build_agent(Duration::from_secs(1), Duration::from_secs(2)),
+            urgent_agent: {
+                let (urgent_connect, urgent_total) = urgent_budget(connect, request);
+                build_agent(urgent_connect, urgent_total)
+            },
             user_agent: user_agent(),
         }
     }
@@ -443,6 +466,69 @@ mod tests {
             201
         );
         mock.assert();
+    }
+
+    #[test]
+    fn test_urgent_budget_is_bounded_by_the_normal_request_and_by_five_seconds() {
+        // Default config: the panic path gets the whole normal budget. It is the
+        // highest-value notice a process sends and the only one with no retry
+        // behind it, so it is not the place to economize.
+        assert_eq!(
+            urgent_budget(Duration::from_secs(4), Duration::from_secs(5)),
+            (Duration::from_secs(4), Duration::from_secs(5))
+        );
+        // A loosened request timeout is capped: background delivery may take 30s,
+        // a crash may not hang for 30s.
+        assert_eq!(
+            urgent_budget(Duration::from_secs(10), Duration::from_secs(30)),
+            (Duration::from_secs(5), Duration::from_secs(5)),
+            "connect is clamped to the total it has to fit inside"
+        );
+        // A deliberate tightening is deference, not something to second-guess
+        // upward: a caller who allowed 500ms for a normal request did not ask for
+        // a 5s hang on panic.
+        assert_eq!(
+            urgent_budget(Duration::from_millis(300), Duration::from_millis(500)),
+            (Duration::from_millis(300), Duration::from_millis(500))
+        );
+    }
+
+    #[test]
+    fn test_a_tightened_request_timeout_shortens_the_urgent_path() {
+        // The urgent budget was a hardcoded 2s, so a caller who tightened
+        // request_timeout to 300ms still got a 2s hang on panic.
+        //
+        // A socket that accepts and then says nothing: the connect succeeds, so
+        // what this measures is the global budget rather than the connect timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            if let Ok((mut sock, _)) = listener.accept() {
+                let _ = std::io::Read::read(&mut sock, &mut [0u8; 1024]);
+                // Must outlast the old hardcoded 2s budget: if the socket closed
+                // sooner, the client would fail on connection-closed rather than
+                // on its timeout, and the test would pass either way.
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        });
+
+        let t = ServerTransport::new(
+            format!("http://{addr}"),
+            "k".into(),
+            Duration::from_millis(500),
+            Duration::from_millis(300),
+        );
+        let body = compress(b"{}");
+        let started = std::time::Instant::now();
+        assert!(
+            t.deliver(&TransportRequest::notices(&body, true)).is_err(),
+            "a silent server must exhaust the urgent budget"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(1200),
+            "the urgent path must honor the 300ms request timeout, not the old fixed 2s (took {:?})",
+            started.elapsed()
+        );
     }
 
     #[test]

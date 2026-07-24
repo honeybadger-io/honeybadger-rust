@@ -234,13 +234,17 @@ impl ConfigBuilder {
         self
     }
     /// TCP connect timeout for delivery. Default: 4s — enough for a cold TLS
-    /// handshake, which 2s was not. (Panic notices use a fixed, shorter timeout:
-    /// the process is already on its way out.)
+    /// handshake, which 2s was not. The panic path derives its own from this and
+    /// [`ConfigBuilder::request_timeout`] rather than using a fixed value.
     pub fn connect_timeout(mut self, v: Duration) -> Self {
         self.connect_timeout = Some(v);
         self
     }
     /// Total timeout for one delivery request. Default: 5s.
+    ///
+    /// This also bounds the synchronous panic path, which never waits longer than
+    /// a normal request may — nor longer than 5s, however high you set this, since
+    /// a crashing process usually has something waiting to restart it.
     pub fn request_timeout(mut self, v: Duration) -> Self {
         self.request_timeout = Some(v);
         self
