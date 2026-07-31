@@ -20,6 +20,13 @@ use std::time::{Duration, Instant};
 /// before compression: the service applies the limit to the decompressed body.
 pub(crate) const MAX_PAYLOAD_BYTES: usize = 262_144;
 
+/// Least time a worker is given to stop, even when the shutdown budget is spent.
+///
+/// Not a delivery allowance — a worker blocked on a socket will not answer within
+/// it either way. It exists so a stage that *would* acknowledge immediately is
+/// never handed a literal zero and detached for no reason.
+const SHUTDOWN_FLOOR: Duration = Duration::from_millis(100);
+
 /// Events-worker lifecycle. `Once` cannot express this: a worker must never be
 /// created after shutdown, which means the state has to be checked and changed
 /// under one lock.
@@ -331,8 +338,18 @@ impl Client {
     }
 
     /// Stops both delivery threads, giving queued work up to `timeout` to
-    /// drain. The client accepts nothing further afterwards.
+    /// drain **in total**. The client accepts nothing further afterwards.
+    ///
+    /// The two pipelines share one budget rather than each receiving `timeout`,
+    /// so this bounds process-exit latency at the number you passed.
     pub fn shutdown(&self, timeout: Duration) {
+        // `None` means the deadline is not representable — a caller's
+        // `Duration::MAX` must not panic here, so fall back to the full timeout
+        // for each stage rather than computing a remainder.
+        let deadline = Instant::now().checked_add(timeout);
+        let remaining =
+            || deadline.map_or(timeout, |d| d.saturating_duration_since(Instant::now()));
+
         // Mark Stopped before touching the worker, so a concurrent event() can
         // never spawn one behind our back.
         let previous = {
@@ -340,9 +357,15 @@ impl Client {
             std::mem::replace(&mut *state, EventsState::Stopped)
         };
         if let EventsState::Running(handle) = previous {
-            handle.shutdown(timeout);
+            // Withhold one floor so a slow events worker cannot starve the
+            // notices worker of the time it needs to stop cleanly.
+            handle.shutdown(
+                remaining()
+                    .saturating_sub(SHUTDOWN_FLOOR)
+                    .max(SHUTDOWN_FLOOR),
+            );
         }
-        self.0.worker.shutdown(timeout);
+        self.0.worker.shutdown(remaining().max(SHUTDOWN_FLOOR));
     }
 
     /// Sends an Insights event. `event_type` always wins over any `event_type`
@@ -569,7 +592,7 @@ impl ClientBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::TestTransport;
+    use crate::transport::{TestTransport, TransportResponse};
     use serde_json::json;
     use std::io::Read;
     use std::sync::Arc;
@@ -594,6 +617,45 @@ mod tests {
             .transport(transport)
             .build()
             .unwrap()
+    }
+
+    #[test]
+    fn test_shutdown_budget_is_shared_by_both_workers() {
+        // Regression: `shutdown(d)` handed `d` to the events worker and then `d`
+        // again to the notices worker, so the documented "up to `timeout`" could
+        // take twice that. A transport that never returns in time pins both.
+        struct Slow;
+        impl Transport for Slow {
+            fn deliver(
+                &self,
+                _req: &TransportRequest,
+            ) -> Result<TransportResponse, TransportError> {
+                std::thread::sleep(Duration::from_secs(10));
+                Ok(201.into())
+            }
+        }
+        let config = crate::Config::builder()
+            .env_source(|_| None)
+            .api_key("k")
+            .env("production")
+            .build()
+            .unwrap();
+        let client = Client::builder(config)
+            .transport(Arc::new(Slow))
+            .build()
+            .unwrap();
+
+        client.event("t", json!({})); // starts the events worker
+        client.notify_notice(crate::Notice::message("X", "y"));
+        std::thread::sleep(Duration::from_millis(150)); // both pick up work
+
+        let started = Instant::now();
+        client.shutdown(Duration::from_millis(800));
+        assert!(
+            started.elapsed() < Duration::from_millis(1300),
+            "shutdown(800ms) must bound both workers together, not give each 800ms (took {:?})",
+            started.elapsed()
+        );
     }
 
     fn delivered(transport: &TestTransport) -> Vec<serde_json::Value> {
