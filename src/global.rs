@@ -9,9 +9,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 static GLOBAL: Mutex<Option<Client>> = Mutex::new(None);
-const GUARD_FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
+const GUARD_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Keeps the global client alive; dropping it flushes and shuts reporting down.
+/// Keeps the global client alive; dropping it shuts reporting down, delivering
+/// whatever is still queued first.
 #[derive(Debug)]
 #[must_use = "dropping the Guard immediately shuts Honeybadger reporting down — bind it (e.g. `let _guard = honeybadger::init(...)?;`)"]
 pub struct Guard {
@@ -51,8 +52,13 @@ impl Drop for Guard {
         crate::panic_hook::deregister();
         let client = GLOBAL.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(client) = client {
-            client.flush(GUARD_FLUSH_TIMEOUT);
-            client.shutdown(GUARD_FLUSH_TIMEOUT);
+            // Shutdown already drains and delivers the queue on both pipelines,
+            // so a flush first bought nothing and paid a second full timeout for
+            // it — against an unreachable endpoint that doubled exit latency.
+            // It also undid a deliberate choice: shutdown discards when the
+            // worker is throttled, and flushing first forced one more attempt
+            // against an endpoint that had just asked us to stop.
+            client.shutdown(GUARD_SHUTDOWN_TIMEOUT);
         }
     }
 }
