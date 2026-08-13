@@ -163,8 +163,13 @@ where
     with_client(|c| c.event_context(entries));
 }
 
-/// Clears the **process-wide** event context, leaving notice context untouched.
-/// A no-op before [`init`].
+/// Clears the event context, leaving notice context untouched. A no-op before
+/// [`init`].
+///
+/// **Without an active scope, this resets state shared by the entire process, not
+/// the calling thread's or task's.** Inside `scope()` (requires the `tokio`
+/// feature) this clears only that request's own event context, leaving every
+/// other request's state — and the process-wide base — untouched.
 pub fn clear_event_context() {
     with_client(|c| c.clear_event_context());
 }
@@ -182,7 +187,12 @@ pub fn request_id(id: impl Into<String>) {
     with_client(|c| c.request_id(id));
 }
 
-/// Clears the process-wide request id. A no-op before [`init`].
+/// Clears the request id set by [`request_id`]. A no-op before [`init`].
+///
+/// **Without an active scope, this resets state shared by the entire process, not
+/// the calling thread's or task's.** Inside `scope()` (requires the `tokio`
+/// feature) this clears only that request's own request id, leaving every other
+/// request's state — and the process-wide base — untouched.
 pub fn clear_request_id() {
     with_client(|c| c.clear_request_id());
 }

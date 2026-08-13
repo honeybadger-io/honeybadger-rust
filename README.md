@@ -66,7 +66,8 @@ request A:  notify(&err)                  // reported against user 2
 ```
 
 `clear_context()` has the same reach: without a scope it clears the shared
-process-wide state, including breadcrumbs, not the calling thread's.
+process-wide context, breadcrumb trail, event context, and request id — not just
+the calling thread's own.
 
 Reserve the global functions, unscoped, for facts that really are process-wide
 (release channel, region, worker identity) or for programs handling one unit of work
@@ -158,9 +159,11 @@ honeybadger::event_context([("service", json!("checkout"))]); // added to every 
 ```
 
 `request_id` also drives sampling: events sharing a request id share one decision, so a
-sampled request keeps all of its events or none. Like `context`, both the event context
-and the request-id slot are **process-wide** — in a concurrent server, put `request_id`
-in the event payload instead, where it travels with the event and cannot be clobbered.
+sampled request keeps all of its events or none. Like `context`, without an active
+scope both the event context and the request-id slot are **process-wide** — in a
+concurrent server, either wrap the request in `scope()` (see above) or put
+`request_id` in the event payload instead, where it travels with the event and cannot
+be clobbered.
 
 ### Configuration
 
