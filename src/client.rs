@@ -752,8 +752,16 @@ mod tests {
         }
         assert!(client.flush(Duration::from_secs(5)));
 
-        for notice in delivered(&transport) {
+        let notices = delivered(&transport);
+        assert_eq!(
+            notices.len(),
+            8,
+            "all 8 notices must arrive, or the per-notice assertions below run vacuously"
+        );
+        let mut whos = Vec::new();
+        for notice in &notices {
             let who = notice["request"]["context"]["who"].as_i64().unwrap();
+            whos.push(who);
             let crumbs = notice["breadcrumbs"]["trail"].as_array().unwrap();
             assert_eq!(crumbs.len(), 1, "exactly this request's own crumb");
             assert_eq!(crumbs[0]["message"], json!(format!("crumb-{who}")));
@@ -765,6 +773,9 @@ mod tests {
                 "request_id must match the same request as the context"
             );
         }
+        whos.sort_unstable();
+        whos.dedup();
+        assert_eq!(whos.len(), 8, "all 8 `who` values must be distinct");
         client.shutdown(Duration::from_secs(5));
     }
 
@@ -828,6 +839,80 @@ mod tests {
         client.shutdown(Duration::from_secs(5));
     }
 
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_breadcrumbs_are_selected_not_merged_when_scoped() {
+        // The rule the Task 3 commit singles out: an active overlay's trail is
+        // used ALONE. If the read ever merged global beneath overlay, this
+        // global crumb would leak into a scoped notice's trail.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.add_breadcrumb("global-crumb", "custom", None);
+
+        crate::scope::scope(async {
+            client.add_breadcrumb("scoped-crumb", "custom", None);
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        let notices = delivered(&transport);
+        assert_eq!(notices.len(), 1);
+        let crumbs = notices[0]["breadcrumbs"]["trail"].as_array().unwrap();
+        assert_eq!(
+            crumbs.len(),
+            1,
+            "the scope's own trail alone, not merged with the global trail"
+        );
+        assert_eq!(crumbs[0]["message"], json!("scoped-crumb"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_clear_context_does_not_erase_global_context_while_scoped() {
+        // The stated safety property: a request clearing its own context
+        // cannot erase the application's process-wide context.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.context([("global_key", json!("g"))]);
+
+        crate::scope::scope(async {
+            client.context([("scoped_key", json!("s"))]);
+            client.clear_context();
+        })
+        .await;
+
+        client.notify_notice(crate::Notice::message("Boom", "x"));
+        assert!(client.flush(Duration::from_secs(5)));
+        let ctx = &delivered(&transport)[0]["request"]["context"];
+        assert_eq!(
+            ctx["global_key"],
+            json!("g"),
+            "clear_context inside a scope must not touch the global base"
+        );
+        assert!(
+            ctx.get("scoped_key").is_none(),
+            "the scope's own context was cleared"
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_unscoped_clear_context_does_clear_the_global() {
+        // Converse of the above: with no scope active, clear_context still
+        // clears the global — the earlier behaviour is unchanged.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.context([("global_key", json!("g"))]);
+        client.clear_context();
+        client.notify_notice(crate::Notice::message("Boom", "x"));
+        assert!(client.flush(Duration::from_secs(5)));
+        let ctx = &delivered(&transport)[0]["request"]["context"];
+        assert!(ctx.get("global_key").is_none());
+        client.shutdown(Duration::from_secs(5));
+    }
+
     fn events_delivered(transport: &TestTransport) -> Vec<serde_json::Value> {
         transport
             .requests()
@@ -860,6 +945,58 @@ mod tests {
         assert_eq!(events[0]["user_id"], json!(7));
         assert_eq!(events[0]["tenant"], json!("acme"));
         assert_eq!(events[0]["request_id"], json!("req-9"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_event_context_write_merge_and_request_id_are_overlay_routed() {
+        // Covers the write, the merged read, and request_id routing in one
+        // test: a scoped event_context() write must land in the overlay, the
+        // global base must still be merged beneath it at read time, and the
+        // overlay wins a key collision.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event_context([("tenant", json!("global")), ("shared", json!("global"))]);
+
+        crate::scope::scope(async {
+            client.event_context([("shared", json!("overlay"))]);
+            client.request_id("req-scoped");
+            client.event("user.created", json!({ "user_id": 7 }));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        // A second, unscoped event proves the scoped write above landed in
+        // the overlay rather than the global: if it had mutated the global,
+        // "shared" would still read "overlay" here, and request_id (never
+        // written globally) would still read "req-scoped".
+        client.event("second.event", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["tenant"],
+            json!("global"),
+            "the global base is still merged beneath the overlay"
+        );
+        assert_eq!(
+            events[0]["shared"],
+            json!("overlay"),
+            "the overlay wins a key collision"
+        );
+        assert_eq!(events[0]["request_id"], json!("req-scoped"));
+
+        assert_eq!(
+            events[1]["shared"],
+            json!("global"),
+            "the scoped write must not have mutated the global event context"
+        );
+        assert!(
+            events[1].get("request_id").is_none(),
+            "the scoped request_id must not have leaked into the global slot"
+        );
         client.shutdown(Duration::from_secs(5));
     }
 
