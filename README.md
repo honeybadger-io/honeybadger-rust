@@ -77,8 +77,8 @@ either belongs on the notice, as above, or inside a scope.
 ### Request-scoped context
 
 With the `tokio` feature enabled, `honeybadger::scope(...)` gives `context()`,
-`add_breadcrumb()`, `event_context()`, and `request_id()` a per-request home instead
-of the process-wide one:
+`add_breadcrumb()`, `event_context()`, and `request_id()` a per-request home, so what
+one request writes is invisible to every other:
 
 ```toml
 [dependencies]
@@ -100,6 +100,19 @@ async fn handle_request(user_id: u64) {
     .await;
 }
 ```
+
+A scope sits on top of the process-wide state rather than replacing it, and the four
+stores do not all resolve the same way:
+
+- `context()` and `event_context()` **merge**: a notice or event reported inside a
+  scope carries the process-wide entries with the request's own on top, and the
+  request wins a key collision. A `version` set once at boot still reaches every
+  scoped notice.
+- The breadcrumb trail is **replaced**: a scoped notice carries that request's crumbs
+  alone, never the process-wide trail, even when the request recorded none — merging
+  trails is the cross-request contamination scoping exists to remove.
+- `request_id()` is the request's own when it set one, and the process-wide id
+  otherwise.
 
 The scope does not cross a `tokio::spawn`, `tokio::task::spawn_blocking`, or
 `std::thread::spawn` boundary on its own — capture it with

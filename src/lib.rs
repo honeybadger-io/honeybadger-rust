@@ -70,8 +70,8 @@
 //! ## Request-scoped context with `scope()`
 //!
 //! With the `tokio` feature enabled, `scope()` gives [`context`], [`add_breadcrumb`],
-//! [`event_context`], and [`request_id`] a per-request home instead of the
-//! process-wide one described above:
+//! [`event_context`], and [`request_id`] a per-request home, so the hazard above does
+//! not apply to what is written inside one:
 //!
 //! ```rust,no_run
 //! # #[cfg(feature = "tokio")]
@@ -87,12 +87,24 @@
 //! ```
 //!
 //! Two requests running concurrently, each in its own `scope()`, never see each
-//! other's values — the hazard above does not apply inside one. The scope does not,
-//! however, cross a `tokio::spawn`, `spawn_blocking`, or `std::thread::spawn`
-//! boundary on its own; see `scope()`'s own documentation (built with `--features
-//! tokio`) for how to carry it across explicitly with `current_scope()` and
-//! `in_scope`/`in_scope_sync`, and `examples/scoped_request.rs` for a complete,
-//! runnable walkthrough.
+//! other's values. A scope is not a replacement for the process-wide state, though —
+//! it sits on top of it, and the four stores do not all resolve the same way:
+//!
+//! - [`context`] and [`event_context`] **merge**. A notice or event reported inside a
+//!   scope carries the process-wide entries with the request's own on top, and the
+//!   request wins a key collision — so a `version` set once at boot still reaches
+//!   every scoped notice.
+//! - The breadcrumb trail is **replaced**. A scoped notice carries that request's
+//!   crumbs alone, never the process-wide trail, even when the request recorded none:
+//!   merging trails is the cross-request contamination scoping exists to remove.
+//! - [`request_id`] is the request's own when it set one, and the process-wide id
+//!   otherwise.
+//!
+//! The scope does not cross a `tokio::spawn`, `spawn_blocking`, or
+//! `std::thread::spawn` boundary on its own; see `scope()`'s own documentation
+//! (built with `--features tokio`) for how to carry it across explicitly with
+//! `current_scope()` and `in_scope`/`in_scope_sync`, and
+//! `examples/scoped_request.rs` for a complete, runnable walkthrough.
 //!
 //! # Insights events
 //!
@@ -120,7 +132,7 @@
 //! Set [`request_id`] to correlate an error with the events around it. It also
 //! drives sampling: events sharing a request id share one decision, so a
 //! sampled request keeps all of its events or none. Like [`context`], the slot
-//! is process-wide — see the warning above.
+//! is process-wide without an active scope — see the warning above.
 //!
 //! # Panics
 //!

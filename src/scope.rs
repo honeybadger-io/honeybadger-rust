@@ -1,8 +1,8 @@
 //! Ambient state: the four stores that answer "what was happening?".
 //!
-//! Today there is exactly one set of them per client, process-wide. Task 3 adds
-//! a per-request overlay in front; this module is where both live so the
-//! resolution rule has one home.
+//! They come in two layers: one process-global set per client, and a per-request
+//! `Overlay` read on top of it. Both live here so the resolution rule has one
+//! home.
 use crate::breadcrumbs::RingBuffer;
 use serde_json::{Map, Value};
 #[cfg(feature = "tokio")]
@@ -49,24 +49,28 @@ impl Overlay {
     /// keeps the request it belongs to. Breadcrumbs are not: inheriting a trail
     /// is exactly the cross-request mixing this exists to remove.
     fn seeded_from_current() -> Overlay {
+        // One lock at a time: each clone is bound on its own so the parent's
+        // guard is released before the next is taken, rather than holding all
+        // three for the length of one `let` while two maps are deep-cloned.
         let (context, event_context, request_id) = match current_overlay() {
-            Some(parent) => (
-                parent
+            Some(parent) => {
+                let context = parent
                     .context
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                parent
+                    .clone();
+                let event_context = parent
                     .event_context
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-                parent
+                    .clone();
+                let request_id = parent
                     .request_id
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .clone(),
-            ),
+                    .clone();
+                (context, event_context, request_id)
+            }
             None => (Map::new(), Map::new(), None),
         };
         Overlay {
@@ -112,26 +116,13 @@ pub(crate) fn merged_context(
     merged
 }
 
-/// Runs `f` with a fresh request scope.
+/// Runs `f` with a fresh request scope, seeded from the enclosing one.
 ///
-/// Ambient state written inside — [`crate::context`], [`crate::add_breadcrumb`],
-/// [`crate::request_id`], [`crate::event_context`] — belongs to this scope and is
-/// invisible to concurrent ones.
-///
-/// **The scope does not cross a thread or task boundary.** It lives in a
-/// thread-local that tokio installs for the duration of each poll, so
-/// `tokio::spawn`, `tokio::task::spawn_blocking`, and `std::thread::spawn` all
-/// start with no scope and fall back to process-global state. Carry it across
-/// explicitly with [`crate::current_scope`] and [`crate::in_scope`].
-///
-/// A `spawn` performed *inside a dependency* cannot be wrapped by the caller,
-/// so those notices fall back to process-global state too. There is no
-/// workaround short of the dependency cooperating.
-///
-/// NOTE: this module is private, so this doc comment is not rendered. The
-/// canonical, rendered copy of this caveat lives on `global::scope` in
-/// `src/global.rs`, since `pub use`-reexported wrappers are what rustdoc
-/// actually shows callers.
+/// This module is private, so nothing here is rendered: the caller-facing docs
+/// for this and the four functions below live on their `pub use`-reexported
+/// wrappers in `src/global.rs`, which is what rustdoc shows and what
+/// `RUSTDOCFLAGS=-D warnings` lint-checks. Keep behaviour notes for maintainers
+/// here and the substance there — one canonical copy, so the two cannot drift.
 #[cfg(feature = "tokio")]
 pub async fn scope<F: Future>(f: F) -> F::Output {
     CURRENT
@@ -155,10 +146,19 @@ pub fn sync_scope<T>(f: impl FnOnce() -> T) -> T {
 #[derive(Clone)]
 pub struct ScopeHandle(Arc<Overlay>);
 
+/// Opaque on purpose. `ScopeHandle` implements `Debug` because a public type
+/// held in user structs should, but the overlay behind it holds the request's
+/// own context and breadcrumb metadata — user data that `filter_keys` redacts on
+/// the way out and that a derived `Debug` would print verbatim into a log.
+#[cfg(feature = "tokio")]
+impl std::fmt::Debug for ScopeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScopeHandle").finish_non_exhaustive()
+    }
+}
+
 /// Captures the current request scope, or a fresh empty one when none is active.
-///
-/// Total by design: an unscoped caller gets a usable handle rather than an
-/// `Option` to unwrap on a path that is often error handling already.
+/// Total by design; the caller-facing caveats are on the `global.rs` wrapper.
 #[cfg(feature = "tokio")]
 pub fn current_scope() -> ScopeHandle {
     ScopeHandle(match current_overlay() {

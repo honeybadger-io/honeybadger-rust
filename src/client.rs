@@ -40,9 +40,11 @@ enum EventsState {
 struct Inner {
     config: Config,
     sanitizer: Sanitizer,
-    /// This client's process-global ambient state. Task 3 puts a per-request
-    /// overlay in front of it.
-    global: Arc<crate::scope::Scope>,
+    /// This client's process-global ambient state — the base a per-request
+    /// overlay is read on top of, and the destination for writes made with no
+    /// scope active. Not shared: `Client` is already `Arc<Inner>`, and the thing
+    /// requests share is the `Arc<Overlay>` in the task-local.
+    global: crate::scope::Scope,
     transport: Arc<dyn Transport>,
     worker: WorkerHandle,
     notice_drops: Arc<DropCounter>,
@@ -577,13 +579,23 @@ impl Client {
         *store.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// The request id in force: the overlay's when it has one, the client's
+    /// global otherwise.
+    ///
+    /// Overlay-over-global, like context — breadcrumbs are the one store that
+    /// replaces rather than merges. A scope that sets no id of its own still
+    /// reports the process-wide one, which also keeps its events on the
+    /// deterministic sampling path instead of the counter.
     pub(crate) fn current_request_id(&self) -> Option<String> {
         if let Some(o) = self.overlay() {
-            return o
+            let scoped = o
                 .request_id
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
+            if scoped.is_some() {
+                return scoped;
+            }
         }
         self.0
             .global
@@ -644,7 +656,7 @@ impl ClientBuilder {
         Ok(Client(Arc::new(Inner {
             config,
             sanitizer,
-            global: Arc::new(crate::scope::Scope::new()),
+            global: crate::scope::Scope::new(),
             transport,
             worker,
             notice_drops,
@@ -792,6 +804,59 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[tokio::test]
+    async fn test_request_id_reads_overlay_over_global_not_overlay_alone() {
+        // Reads merge the client's global beneath the overlay, and breadcrumbs
+        // are the SOLE exception. An overlay-exclusive read would hide a
+        // globally-set request_id from every scope that does not set its own —
+        // and, because a missing id falls back to the counter, would puncture
+        // that request's deterministic event sampling. Both directions are
+        // asserted: the fallback, then the overlay winning.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.request_id("req-global");
+
+        crate::scope::scope(async {
+            // This scope sets no request_id of its own.
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            client.event("scoped.event", json!({}));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        crate::scope::scope(async {
+            client.request_id("req-scoped");
+            client.notify_notice(crate::Notice::message("Boom", "y"));
+            client.event("own.event", json!({}));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        let notices = delivered(&transport);
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices[0]["correlation_context"]["request_id"],
+            json!("req-global"),
+            "an overlay with no request_id of its own must not hide the global one"
+        );
+        assert_eq!(
+            notices[1]["correlation_context"]["request_id"],
+            json!("req-scoped"),
+            "the overlay's own id still wins over the global"
+        );
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["request_id"],
+            json!("req-global"),
+            "the same fallback drives event correlation and sampling"
+        );
+        assert_eq!(events[1]["request_id"], json!("req-scoped"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
     async fn test_an_unscoped_spawn_does_poison_later_scopes() {
         // The failure mode behind shipping a capture API: a child with no scope
         // writes to the client's global store, which every later scope merges
@@ -821,8 +886,9 @@ mod tests {
             leaked,
             Some(json!(true)),
             "documents the known hazard: an unscoped write lands in the global \
-             base and every later scope merges it. Task 4's capture API is the \
-             remedy; if this ever returns None the docs must be updated."
+             base and every later scope merges it. Capturing the scope with \
+             current_scope()/in_scope() is the remedy; if this ever returns \
+             None the docs must be updated."
         );
         client.shutdown(Duration::from_secs(5));
     }
@@ -853,9 +919,9 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn test_breadcrumbs_are_selected_not_merged_when_scoped() {
-        // The rule the Task 3 commit singles out: an active overlay's trail is
-        // used ALONE. If the read ever merged global beneath overlay, this
-        // global crumb would leak into a scoped notice's trail.
+        // Breadcrumbs are the one store that is never merged: an active
+        // overlay's trail is used ALONE. If the read ever merged global beneath
+        // overlay, this global crumb would leak into a scoped notice's trail.
         let transport = Arc::new(TestTransport::new());
         let client = test_client(transport.clone());
         client.add_breadcrumb("global-crumb", "custom", None);
