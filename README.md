@@ -55,9 +55,9 @@ honeybadger::notify_notice(
 ```
 
 There is also `honeybadger::context(...)`, which sets context for **every** later
-notice. It is process-wide — not per request, not per thread, not per task — so in a
-concurrent server one request overwrites another's values and an error can be reported
-against the wrong user:
+notice. Without an active scope (see below) it is process-wide — not per request, not
+per thread, not per task — so in a concurrent server one request overwrites another's
+values and an error can be reported against the wrong user:
 
 ```text
 request A:  context([("user_id", 1)])
@@ -65,15 +65,71 @@ request B:  context([("user_id", 2)])     // overwrites A
 request A:  notify(&err)                  // reported against user 2
 ```
 
-`clear_context()` has the same reach: it clears the shared process-wide state, including
-breadcrumbs, not the calling thread's.
+`clear_context()` has the same reach: without a scope it clears the shared
+process-wide context, breadcrumb trail, event context, and request id — not just
+the calling thread's own.
 
-Reserve the global functions for facts that really are process-wide (release channel,
-region, worker identity) or for programs handling one unit of work at a time — a CLI, a
-cron job, a serialized consumer. Everything request-shaped belongs on the notice.
+Reserve the global functions, unscoped, for facts that really are process-wide
+(release channel, region, worker identity) or for programs handling one unit of work
+at a time — a CLI, a cron job, a serialized consumer. Everything request-shaped
+either belongs on the notice, as above, or inside a scope.
 
-Per-request scoping, where `context()` follows the current request automatically, comes
-with the planned `tracing` layer and tower/axum middleware.
+### Request-scoped context
+
+With the `tokio` feature enabled, `honeybadger::scope(...)` gives `context()`,
+`add_breadcrumb()`, `event_context()`, and `request_id()` a per-request home, so what
+one request writes is invisible to every other:
+
+```toml
+[dependencies]
+honeybadger = { version = "0.5", features = ["tokio"] }
+```
+
+```rust
+use serde_json::json;
+
+async fn handle_request(user_id: u64) {
+    honeybadger::scope(async {
+        honeybadger::request_id(format!("req-{user_id}"));
+        honeybadger::context([("user_id", json!(user_id))]);
+
+        // ... do the request's work; any notice or event reported in here
+        // carries only this request's data, even with other requests running
+        // concurrently ...
+    })
+    .await;
+}
+```
+
+A scope sits on top of the process-wide state rather than replacing it, and the four
+stores do not all resolve the same way:
+
+- `context()` and `event_context()` **merge**: a notice or event reported inside a
+  scope carries the process-wide entries with the request's own on top, and the
+  request wins a key collision. A `version` set once at boot still reaches every
+  scoped notice.
+- The breadcrumb trail is **replaced**: a scoped notice carries that request's crumbs
+  alone, never the process-wide trail, even when the request recorded none — merging
+  trails is the cross-request contamination scoping exists to remove.
+- `request_id()` is the request's own when it set one, and the process-wide id
+  otherwise.
+
+The scope does not cross a `tokio::spawn`, `tokio::task::spawn_blocking`, or
+`std::thread::spawn` boundary on its own — capture it with
+`honeybadger::ScopeHandle::current()` and re-enter it on the other side with
+`ScopeHandle::enter`/`enter_sync`. See the
+[`scope` docs](https://docs.rs/honeybadger) (built with `--features tokio`) for the
+full explanation, including the one case no API can fix — a `spawn` inside a
+third-party dependency — and `examples/scoped_request.rs` for a complete, runnable
+walkthrough:
+
+```sh
+cargo run --features tokio --example scoped_request
+```
+
+The example runs in the `development` environment, which `exclude_envs` excludes from
+reporting by default, so it exercises the whole assembly pipeline against the null
+transport and sends nothing over the network.
 
 Configuration is env-var friendly: `HONEYBADGER_API_KEY`, `HONEYBADGER_ENV`,
 `HONEYBADGER_REVISION`, `HONEYBADGER_ROOT`, `HONEYBADGER_HOSTNAME`,
@@ -120,9 +176,11 @@ honeybadger::event_context([("service", json!("checkout"))]); // added to every 
 ```
 
 `request_id` also drives sampling: events sharing a request id share one decision, so a
-sampled request keeps all of its events or none. Like `context`, both the event context
-and the request-id slot are **process-wide** — in a concurrent server, put `request_id`
-in the event payload instead, where it travels with the event and cannot be clobbered.
+sampled request keeps all of its events or none. Like `context`, without an active
+scope both the event context and the request-id slot are **process-wide** — in a
+concurrent server, either wrap the request in `scope()` (see above) or put
+`request_id` in the event payload instead, where it travels with the event and cannot
+be clobbered.
 
 ### Configuration
 

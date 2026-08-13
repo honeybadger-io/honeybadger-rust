@@ -9,6 +9,14 @@ name: CI
 # branches, because those branches select the toolchain by their *name*. Pinning them
 # would freeze the name away, so the toolchain moves to an explicit `toolchain:` input.
 
+# Least privilege, rather than whatever the repository default happens to be: every
+# job below only checks out the tree and runs cargo or actionlint, and `actions/
+# checkout` is the only step that uses the token at all. A future job that needs to
+# write something — a PR comment, a release, an OIDC exchange — should widen its own
+# `permissions:` block rather than this one.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
@@ -33,7 +41,13 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features tokio -- -D warnings
       - run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      # The scope API — its intra-doc links into `tokio::` and its doctest — only
+      # exists with the feature, so the default run above never sees it.
+      - run: cargo doc --no-deps --features tokio
         env:
           RUSTDOCFLAGS: -D warnings
 
@@ -54,6 +68,7 @@ jobs:
       # The panic-hook tests spawn fixture processes via nested `cargo run`, so this
       # job compiles the crate three times over; it is slower than it looks.
       - run: cargo test
+      - run: cargo test --features tokio
 
   msrv:
     runs-on: ubuntu-latest

@@ -10,6 +10,12 @@ readme = "README.md"
 categories = ["development-tools::debugging", "web-programming"]
 keywords = ["honeybadger", "error", "monitoring", "exception"]
 
+[features]
+# Request-scoped context via a tokio task-local. Named for the dependency it
+# pulls in rather than the capability, so the cost is visible at the call site.
+# tokio's `rt` feature is `rt = []` — it adds no transitive crates.
+tokio = ["dep:tokio"]
+
 [dependencies]
 backtrace = "0.3"
 crossbeam-channel = "0.5"
@@ -20,8 +26,20 @@ log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt"], optional = true }
 ureq = { version = "3", default-features = false, features = ["rustls", "gzip"] }
 
 [dev-dependencies]
 env_logger = "0.11"
 mockito = "1"
+# `rt-multi-thread` is required by `#[tokio::test(flavor = "multi_thread")]`,
+# which the request-isolation test in src/client.rs uses — without it that
+# attribute fails to compile.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+
+# scoped_request calls honeybadger::scope, which does not exist without the
+# `tokio` feature. Without this stanza, `cargo build --examples` on the default
+# (no-feature) build would try and fail to compile it.
+[[example]]
+name = "scoped_request"
+required-features = ["tokio"]

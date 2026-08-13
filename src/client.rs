@@ -1,5 +1,5 @@
 //! Client: shared state + the notify pipeline (spec "Notify pipeline").
-use crate::breadcrumbs::{Breadcrumb, RingBuffer};
+use crate::breadcrumbs::Breadcrumb;
 use crate::config::Config;
 use crate::drops::DropCounter;
 use crate::error::Error;
@@ -40,13 +40,14 @@ enum EventsState {
 struct Inner {
     config: Config,
     sanitizer: Sanitizer,
-    context: Mutex<Map<String, Value>>,
-    breadcrumbs: Mutex<RingBuffer>,
+    /// This client's process-global ambient state — the base a per-request
+    /// overlay is read on top of, and the destination for writes made with no
+    /// scope active. Not shared: `Client` is already `Arc<Inner>`, and the thing
+    /// requests share is the `Arc<Overlay>` in the task-local.
+    global: crate::request_scope::Scope,
     transport: Arc<dyn Transport>,
     worker: WorkerHandle,
     notice_drops: Arc<DropCounter>,
-    event_context: Mutex<Map<String, Value>>,
-    request_id: Mutex<Option<String>>,
     events: Mutex<EventsState>,
     event_drops: Arc<DropCounter>,
     sampler: Sampler,
@@ -125,24 +126,39 @@ impl Client {
         crate::bt::capture(&self.0.config.root)
     }
 
+    /// The overlay for the current request, if a scope is active.
+    fn overlay(&self) -> Option<Arc<crate::request_scope::Overlay>> {
+        crate::request_scope::current_overlay()
+    }
+
     /// Spec pipeline steps 1–6. Returns the compressed wire payload, or None if dropped.
     fn run_pipeline(&self, mut notice: Notice) -> Option<Vec<u8>> {
         let inner = &*self.0;
 
         // 1. Assembly inputs: scope context (local wins), breadcrumbs, backtrace frames.
-        let scope = inner
-            .context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        notice.merge_scope_context(scope);
+        let overlay = self.overlay();
+        let scope_context = crate::request_scope::merged_context(
+            &inner.global.context,
+            overlay.as_ref().map(|o| &o.context),
+        );
+        notice.merge_scope_context(scope_context);
         let request_id_fallback = self.current_request_id();
         let breadcrumbs = inner.config.breadcrumbs_enabled.then(|| {
-            inner
-                .breadcrumbs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .snapshot()
+            // Never merged: an active overlay's trail is used alone, because
+            // merging the global trail reintroduces the cross-request mixing.
+            match &overlay {
+                Some(o) => o
+                    .breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot(),
+                None => inner
+                    .global
+                    .breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot(),
+            }
         });
         let frames = match (notice.frames.take(), notice.raw_backtrace.take()) {
             (Some(frames), _) => Some(frames), // pre-processed (panic path)
@@ -238,11 +254,13 @@ impl Client {
     /// Merges key/value pairs into this client's context, attached to every later
     /// notice. Setting a key to [`serde_json::Value::Null`] removes it.
     ///
-    /// **Shared by every thread and task using this client — it is not request-scoped.**
-    /// Concurrent requests overwrite each other here, which can attribute one user's
-    /// error to another. Use it for process-wide facts; put request data on the notice
-    /// via [`Notice::context`], which travels with the notice and cannot be clobbered.
-    /// See [the crate docs](crate#context-is-process-wide).
+    /// **Without an active scope, this is shared by every thread and task using this
+    /// client — it is not request-scoped.** Concurrent requests overwrite each other
+    /// here, which can attribute one user's error to another. Use it for process-wide
+    /// facts; put request data on the notice via [`Notice::context`], which travels
+    /// with the notice and cannot be clobbered. Inside `scope()` (requires the `tokio`
+    /// feature) this call writes to that request's own context instead — see
+    /// [the crate docs](crate#context-is-process-wide).
     ///
     /// Notice-local context wins on key collisions.
     pub fn context<I, K>(&self, entries: I)
@@ -250,7 +268,12 @@ impl Client {
         I: IntoIterator<Item = (K, Value)>,
         K: Into<String>,
     {
-        let mut ctx = self.0.context.lock().unwrap_or_else(|e| e.into_inner());
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.context,
+            None => &self.0.global.context,
+        };
+        let mut ctx = store.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in entries {
             let key = k.into();
             if v.is_null() {
@@ -264,31 +287,50 @@ impl Client {
     /// Clears this client's context, its breadcrumb trail, its event context, and its
     /// request id — the whole accumulated diagnostic scope.
     ///
-    /// The scope is shared process-wide, so this discards what every other in-flight
-    /// caller has accumulated too. It suits programs that handle one unit of work at a
-    /// time (a CLI, a cron job, a serialized queue consumer); calling it from a
-    /// concurrent request handler will erase other requests' state.
+    /// Without an active scope, this state is shared process-wide, so this discards
+    /// what every other in-flight caller has accumulated too. It suits programs that
+    /// handle one unit of work at a time (a CLI, a cron job, a serialized queue
+    /// consumer); calling it from a concurrent request handler will erase other
+    /// requests' state. Inside `scope()` (requires the `tokio` feature) this clears
+    /// only that request's own scope, leaving every other request's state — and the
+    /// process-wide base — untouched.
     pub fn clear_context(&self) {
-        self.0
-            .context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.0
-            .breadcrumbs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.clear_event_context();
-        self.clear_request_id();
+        match self.overlay() {
+            Some(o) => {
+                o.context.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                o.breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                o.event_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *o.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            None => {
+                let g = &self.0.global;
+                g.context.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                g.breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                g.event_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *g.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
     }
 
     /// Records a breadcrumb. The most recent 40 are attached to each notice; older ones
     /// fall off. A no-op when breadcrumbs are disabled in the config.
     ///
-    /// The trail is shared process-wide, not per request: under concurrency, crumbs from
-    /// unrelated requests interleave and evict one another. Treat it as a process-level
-    /// log rather than a request timeline.
+    /// Without an active scope the trail is process-wide, and under concurrency
+    /// crumbs from unrelated requests interleave and evict one another — treat it
+    /// as a process-level log. Inside `scope()` (requires the `tokio` feature) the
+    /// trail belongs to that request alone.
     pub fn add_breadcrumb(
         &self,
         message: &str,
@@ -298,8 +340,12 @@ impl Client {
         if !self.0.config.breadcrumbs_enabled {
             return;
         }
-        self.0
-            .breadcrumbs
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.breadcrumbs,
+            None => &self.0.global.breadcrumbs,
+        };
+        store
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Breadcrumb::new(message, category, metadata));
@@ -391,11 +437,11 @@ impl Client {
         if !inner.config.events_enabled {
             return;
         }
-        let scope = inner
-            .event_context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let overlay = self.overlay();
+        let scope = crate::request_scope::merged_context(
+            &inner.global.event_context,
+            overlay.as_ref().map(|o| &o.event_context),
+        );
         let request_id = self.current_request_id();
         let Some(line) = assemble_event(
             event_type,
@@ -464,20 +510,23 @@ impl Client {
     /// Merges key/value pairs into this client's **event** context, attached to
     /// every later event. Setting a key to [`serde_json::Value::Null`] removes it.
     ///
-    /// **Shared by every thread and task using this client — it is not
-    /// request-scoped.** Concurrent requests overwrite each other here. Use it
-    /// for process-wide facts and put per-request data in the event payload,
-    /// where it travels with the event and cannot be clobbered.
+    /// **Without an active scope, this is shared by every thread and task using
+    /// this client — it is not request-scoped.** Concurrent requests overwrite
+    /// each other here. Use it for process-wide facts and put per-request data
+    /// in the event payload, where it travels with the event and cannot be
+    /// clobbered. Inside `scope()` (requires the `tokio` feature) this call
+    /// writes to that request's own event context instead.
     pub fn event_context<I, K>(&self, entries: I)
     where
         I: IntoIterator<Item = (K, Value)>,
         K: Into<String>,
     {
-        let mut ctx = self
-            .0
-            .event_context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.event_context,
+            None => &self.0.global.event_context,
+        };
+        let mut ctx = store.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in entries {
             let key = k.into();
             if v.is_null() {
@@ -490,34 +539,66 @@ impl Client {
 
     /// Clears this client's event context, leaving notice context untouched.
     pub fn clear_event_context(&self) {
-        self.0
-            .event_context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.event_context,
+            None => &self.0.global.event_context,
+        };
+        store.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Sets the request id correlating this client's notices and events, and
     /// driving deterministic sampling — every event sharing an id shares one
     /// sampling decision.
     ///
-    /// **This slot is process-wide, exactly like [`Client::context`].** The name
-    /// describes what you put in it, not a scoping guarantee. Under concurrency
-    /// one request's id overwrites another's, so an event can be attributed
-    /// *and sampled* as the wrong request. Use it in programs that handle one
-    /// unit of work at a time — a CLI, a cron job, a serialized consumer — and
-    /// in a concurrent server put `request_id` in the event payload instead.
+    /// **Without an active scope, this slot is process-wide, exactly like
+    /// [`Client::context`].** The name describes what you put in it, not a
+    /// scoping guarantee: under concurrency one request's id overwrites
+    /// another's, so an event can be attributed *and sampled* as the wrong
+    /// request. Use it in programs that handle one unit of work at a time — a
+    /// CLI, a cron job, a serialized consumer — and in a concurrent server
+    /// either wrap the request in `scope()` (requires the `tokio` feature),
+    /// which gives this call its own request-local slot, or, without the
+    /// feature, put `request_id` in the event payload instead.
     pub fn request_id(&self, id: impl Into<String>) {
-        *self.0.request_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.into());
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.request_id,
+            None => &self.0.global.request_id,
+        };
+        *store.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.into());
     }
 
     /// Clears the request id set by [`Client::request_id`].
     pub fn clear_request_id(&self) {
-        *self.0.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.request_id,
+            None => &self.0.global.request_id,
+        };
+        *store.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
+    /// The request id in force: the overlay's when it has one, the client's
+    /// global otherwise.
+    ///
+    /// Overlay-over-global, like context — breadcrumbs are the one store that
+    /// replaces rather than merges. A scope that sets no id of its own still
+    /// reports the process-wide one, which also keeps its events on the
+    /// deterministic sampling path instead of the counter.
     pub(crate) fn current_request_id(&self) -> Option<String> {
+        if let Some(o) = self.overlay() {
+            let scoped = o
+                .request_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if scoped.is_some() {
+                return scoped;
+            }
+        }
         self.0
+            .global
             .request_id
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -575,13 +656,10 @@ impl ClientBuilder {
         Ok(Client(Arc::new(Inner {
             config,
             sanitizer,
-            context: Mutex::new(Map::new()),
-            breadcrumbs: Mutex::new(RingBuffer::new()),
+            global: crate::request_scope::Scope::new(),
             transport,
             worker,
             notice_drops,
-            event_context: Mutex::new(Map::new()),
-            request_id: Mutex::new(None),
             events: Mutex::new(EventsState::NotStarted),
             event_drops: Arc::new(DropCounter::new("events")),
             sampler,
@@ -673,6 +751,281 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "tokio")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_requests_do_not_share_state() {
+        // The bug this feature exists to fix. Before scoping, each notice
+        // carried whatever the global 40-entry trail happened to hold.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let client = client.clone();
+            handles.push(tokio::spawn(crate::request_scope::scope(async move {
+                client.request_id(format!("req-{i}"));
+                client.context([("who", json!(i))]);
+                client.add_breadcrumb(&format!("crumb-{i}"), "custom", None);
+                tokio::task::yield_now().await;
+                client.notify_notice(crate::Notice::message("Boom", "x"));
+            })));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let notices = delivered(&transport);
+        assert_eq!(
+            notices.len(),
+            8,
+            "all 8 notices must arrive, or the per-notice assertions below run vacuously"
+        );
+        let mut whos = Vec::new();
+        for notice in &notices {
+            let who = notice["request"]["context"]["who"].as_i64().unwrap();
+            whos.push(who);
+            let crumbs = notice["breadcrumbs"]["trail"].as_array().unwrap();
+            assert_eq!(crumbs.len(), 1, "exactly this request's own crumb");
+            assert_eq!(crumbs[0]["message"], json!(format!("crumb-{who}")));
+            // The request-id slot lands in `correlation_context`, not
+            // `request.context` — see `assemble` in src/notice.rs.
+            assert_eq!(
+                notice["correlation_context"]["request_id"],
+                json!(format!("req-{who}")),
+                "request_id must match the same request as the context"
+            );
+        }
+        whos.sort_unstable();
+        whos.dedup();
+        assert_eq!(whos.len(), 8, "all 8 `who` values must be distinct");
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_request_id_reads_overlay_over_global_not_overlay_alone() {
+        // Reads merge the client's global beneath the overlay, and breadcrumbs
+        // are the SOLE exception. An overlay-exclusive read would hide a
+        // globally-set request_id from every scope that does not set its own —
+        // and, because a missing id falls back to the counter, would puncture
+        // that request's deterministic event sampling. Both directions are
+        // asserted: the fallback, then the overlay winning.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.request_id("req-global");
+
+        crate::request_scope::scope(async {
+            // This scope sets no request_id of its own.
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            client.event("scoped.event", json!({}));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        crate::request_scope::scope(async {
+            client.request_id("req-scoped");
+            client.notify_notice(crate::Notice::message("Boom", "y"));
+            client.event("own.event", json!({}));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        let notices = delivered(&transport);
+        assert_eq!(notices.len(), 2);
+        assert_eq!(
+            notices[0]["correlation_context"]["request_id"],
+            json!("req-global"),
+            "an overlay with no request_id of its own must not hide the global one"
+        );
+        assert_eq!(
+            notices[1]["correlation_context"]["request_id"],
+            json!("req-scoped"),
+            "the overlay's own id still wins over the global"
+        );
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["request_id"],
+            json!("req-global"),
+            "the same fallback drives event correlation and sampling"
+        );
+        assert_eq!(events[1]["request_id"], json!("req-scoped"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_an_unscoped_spawn_does_poison_later_scopes() {
+        // The failure mode behind shipping a capture API: a child with no scope
+        // writes to the client's global store, which every later scope merges
+        // beneath itself. Left unchecked, one request's context persists into
+        // all subsequent ones.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+
+        crate::request_scope::scope(async {
+            let c = client.clone();
+            // Deliberately NOT re-entered with ScopeHandle::enter — the hazard.
+            tokio::spawn(async move { c.context([("leaked", json!(true))]) })
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let leaked = crate::request_scope::scope(async {
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            assert!(client.flush(Duration::from_secs(5)));
+            delivered(&transport)[0]["request"]["context"]
+                .get("leaked")
+                .cloned()
+        })
+        .await;
+        assert_eq!(
+            leaked,
+            Some(json!(true)),
+            "documents the known hazard: an unscoped write lands in the global \
+             base and every later scope merges it. Capturing the scope with \
+             ScopeHandle::current()/enter() is the remedy; if this ever returns \
+             None the docs must be updated."
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_global_context_set_after_scope_entry_is_visible() {
+        // The property a snapshot-based design would have lost.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        crate::request_scope::scope(async {
+            client.context([("in_scope", json!(1))]);
+            // A different clone writes globally, from outside any scope.
+            let outside = client.clone();
+            std::thread::spawn(move || outside.context([("late", json!(2))]))
+                .join()
+                .unwrap();
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            assert!(client.flush(Duration::from_secs(5)));
+            let ctx = &delivered(&transport)[0]["request"]["context"];
+            assert_eq!(ctx["in_scope"], json!(1));
+            assert_eq!(ctx["late"], json!(2), "merged at read time, not copied");
+        })
+        .await;
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_breadcrumbs_are_selected_not_merged_when_scoped() {
+        // Breadcrumbs are the one store that is never merged: an active
+        // overlay's trail is used ALONE. If the read ever merged global beneath
+        // overlay, this global crumb would leak into a scoped notice's trail.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.add_breadcrumb("global-crumb", "custom", None);
+
+        crate::request_scope::scope(async {
+            client.add_breadcrumb("scoped-crumb", "custom", None);
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        let notices = delivered(&transport);
+        assert_eq!(notices.len(), 1);
+        let crumbs = notices[0]["breadcrumbs"]["trail"].as_array().unwrap();
+        assert_eq!(
+            crumbs.len(),
+            1,
+            "the scope's own trail alone, not merged with the global trail"
+        );
+        assert_eq!(crumbs[0]["message"], json!("scoped-crumb"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_clear_context_does_not_erase_global_context_while_scoped() {
+        // The stated safety property, for all four sub-stores clear_context
+        // touches: a request clearing its own context/breadcrumbs/
+        // event_context/request_id cannot erase the application's
+        // process-wide versions of any of them. A leak confined to just one
+        // of the three non-context stores must fail this test.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.context([("global_key", json!("g"))]);
+        client.add_breadcrumb("global-crumb", "custom", None);
+        client.event_context([("global_event_key", json!("ge"))]);
+        client.request_id("req-global");
+
+        crate::request_scope::scope(async {
+            client.context([("scoped_key", json!("s"))]);
+            client.add_breadcrumb("scoped-crumb", "custom", None);
+            client.event_context([("scoped_event_key", json!("se"))]);
+            client.request_id("req-scoped");
+            client.clear_context();
+        })
+        .await;
+
+        client.notify_notice(crate::Notice::message("Boom", "x"));
+        client.event("after.scope", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let notice = &delivered(&transport)[0];
+        let ctx = &notice["request"]["context"];
+        assert_eq!(
+            ctx["global_key"],
+            json!("g"),
+            "clear_context inside a scope must not touch the global context"
+        );
+        assert!(
+            ctx.get("scoped_key").is_none(),
+            "the scope's own context was cleared"
+        );
+
+        let crumbs = notice["breadcrumbs"]["trail"].as_array().unwrap();
+        assert_eq!(
+            crumbs.len(),
+            1,
+            "the global breadcrumb trail must survive a scoped clear_context"
+        );
+        assert_eq!(crumbs[0]["message"], json!("global-crumb"));
+
+        assert_eq!(
+            notice["correlation_context"]["request_id"],
+            json!("req-global"),
+            "the global request_id must survive a scoped clear_context"
+        );
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["global_event_key"],
+            json!("ge"),
+            "the global event_context must survive a scoped clear_context"
+        );
+        assert!(events[0].get("scoped_event_key").is_none());
+
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[test]
+    fn test_unscoped_clear_context_does_clear_the_global() {
+        // Converse of the above: with no scope active, clear_context still
+        // clears the global — the earlier behaviour is unchanged.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.context([("global_key", json!("g"))]);
+        client.clear_context();
+        client.notify_notice(crate::Notice::message("Boom", "x"));
+        assert!(client.flush(Duration::from_secs(5)));
+        let ctx = &delivered(&transport)[0]["request"]["context"];
+        assert!(ctx.get("global_key").is_none());
+        client.shutdown(Duration::from_secs(5));
+    }
+
     fn events_delivered(transport: &TestTransport) -> Vec<serde_json::Value> {
         transport
             .requests()
@@ -705,6 +1058,93 @@ mod tests {
         assert_eq!(events[0]["user_id"], json!(7));
         assert_eq!(events[0]["tenant"], json!("acme"));
         assert_eq!(events[0]["request_id"], json!("req-9"));
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_event_context_write_merge_and_request_id_are_overlay_routed() {
+        // Covers the write, the merged read, and request_id routing in one
+        // test: a scoped event_context() write must land in the overlay, the
+        // global base must still be merged beneath it at read time, and the
+        // overlay wins a key collision.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event_context([("tenant", json!("global")), ("shared", json!("global"))]);
+
+        crate::request_scope::scope(async {
+            client.event_context([("shared", json!("overlay"))]);
+            client.request_id("req-scoped");
+            client.event("user.created", json!({ "user_id": 7 }));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        // A second, unscoped event proves the scoped write above landed in
+        // the overlay rather than the global: if it had mutated the global,
+        // "shared" would still read "overlay" here, and request_id (never
+        // written globally) would still read "req-scoped".
+        client.event("second.event", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0]["tenant"],
+            json!("global"),
+            "the global base is still merged beneath the overlay"
+        );
+        assert_eq!(
+            events[0]["shared"],
+            json!("overlay"),
+            "the overlay wins a key collision"
+        );
+        assert_eq!(events[0]["request_id"], json!("req-scoped"));
+
+        assert_eq!(
+            events[1]["shared"],
+            json!("global"),
+            "the scoped write must not have mutated the global event context"
+        );
+        assert!(
+            events[1].get("request_id").is_none(),
+            "the scoped request_id must not have leaked into the global slot"
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_clear_event_context_does_not_erase_the_global_while_scoped() {
+        // clear_event_context() had zero coverage: neither its overlay-vs-global
+        // routing nor the safety property (a scoped clear must not erase the
+        // global) was exercised anywhere in the suite.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event_context([("global_key", json!("g"))]);
+
+        crate::request_scope::scope(async {
+            client.event_context([("overlay_key", json!("o"))]);
+            client.clear_event_context();
+            client.event("scoped.event", json!({}));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        client.event("unscoped.event", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].get("overlay_key").is_none(),
+            "the scoped clear_event_context must have cleared the overlay's own entry"
+        );
+        assert_eq!(
+            events[1]["global_key"],
+            json!("g"),
+            "a scoped clear_event_context must not erase the global event context"
+        );
         client.shutdown(Duration::from_secs(5));
     }
 

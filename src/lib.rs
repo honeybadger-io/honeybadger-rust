@@ -30,9 +30,10 @@
 //!
 //! # Context is process-wide
 //!
-//! **[`context`] and [`add_breadcrumb`] write to one store shared by the whole process.
-//! They are not request-scoped, and not thread- or task-local.** In a concurrent server
-//! this is a data-attribution hazard:
+//! **[`context`] and [`add_breadcrumb`] write to one store shared by the whole
+//! process, unless a request scope is active. Without one, they are not
+//! request-scoped, and not thread- or task-local.** In a concurrent server this is
+//! a data-attribution hazard:
 //!
 //! ```text
 //! request A:  context([("user_id", 1)])
@@ -43,11 +44,13 @@
 //! Either request calling [`clear_context`] also wipes the other's state. Attaching one
 //! user's data to another user's error is a privacy problem, not just a confusing graph.
 //!
-//! Use the global functions only for data that is genuinely process-wide (release
-//! channel, region, worker identity) or for programs that handle one unit of work at a
-//! time — a CLI, a cron job, a single-threaded consumer.
+//! Without a scope, use the global functions only for data that is genuinely
+//! process-wide (release channel, region, worker identity) or for programs that
+//! handle one unit of work at a time — a CLI, a cron job, a single-threaded
+//! consumer.
 //!
-//! **For anything belonging to a request, put it on the notice:**
+//! **For anything belonging to a request, either enter a scope (below) or put it on
+//! the notice:**
 //!
 //! ```rust,no_run
 //! # fn handle(err: &std::io::Error, user_id: u64, request_id: &str) {
@@ -64,9 +67,45 @@
 //! cannot be overwritten by a concurrent request. Where both are set, notice-local keys
 //! win over the process-wide ones.
 //!
-//! Automatic per-request scoping — where `context()` resolves to the current request
-//! rather than the process — arrives with the planned `tracing` layer and tower/axum
-//! middleware. Until then, the rule above is the whole story.
+//! ## Request-scoped context with `scope()`
+//!
+//! With the `tokio` feature enabled, `scope()` gives [`context`], [`add_breadcrumb`],
+//! [`event_context`], and [`request_id`] a per-request home, so the hazard above does
+//! not apply to what is written inside one:
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "tokio")]
+//! # async fn handler() {
+//! honeybadger::scope(async {
+//!     honeybadger::request_id("req-42");
+//!     honeybadger::context([("user_id", serde_json::json!(7))]);
+//!     // ... handle the request; notices and events reported in here carry only
+//!     // this request's data ...
+//! })
+//! .await;
+//! # }
+//! ```
+//!
+//! Two requests running concurrently, each in its own `scope()`, never see each
+//! other's values. A scope is not a replacement for the process-wide state, though —
+//! it sits on top of it, and the four stores do not all resolve the same way:
+//!
+//! - [`context`] and [`event_context`] **merge**. A notice or event reported inside a
+//!   scope carries the process-wide entries with the request's own on top, and the
+//!   request wins a key collision — so a `version` set once at boot still reaches
+//!   every scoped notice.
+//! - The breadcrumb trail is **replaced**. A scoped notice carries that request's
+//!   crumbs alone, never the process-wide trail, even when the request recorded none:
+//!   merging trails is the cross-request contamination scoping exists to remove.
+//! - [`request_id`] is the request's own when it set one, and the process-wide id
+//!   otherwise.
+//!
+//! The scope does not cross a `tokio::spawn`, `spawn_blocking`, or
+//! `std::thread::spawn` boundary on its own; see `scope()`'s own documentation
+//! (built with `--features tokio`) for how to carry it across explicitly by
+//! capturing a `ScopeHandle::current()` and re-entering it with
+//! `ScopeHandle::enter`/`enter_sync`, and `examples/scoped_request.rs` for a
+//! complete, runnable walkthrough.
 //!
 //! # Insights events
 //!
@@ -94,7 +133,7 @@
 //! Set [`request_id`] to correlate an error with the events around it. It also
 //! drives sampling: events sharing a request id share one decision, so a
 //! sampled request keeps all of its events or none. Like [`context`], the slot
-//! is process-wide — see the warning above.
+//! is process-wide without an active scope — see the warning above.
 //!
 //! # Panics
 //!
@@ -122,6 +161,11 @@ mod events_worker;
 mod global;
 mod notice;
 mod panic_hook;
+// Named `request_scope`, not `scope`, so that `crate::scope` in an intra-doc link
+// unambiguously means the re-exported `scope` function rather than colliding with
+// a module of the same name — an error under `--document-private-items`. The
+// module name is private, so callers never see it.
+mod request_scope;
 mod sanitizer;
 mod transport;
 mod worker;
@@ -135,6 +179,8 @@ pub use crate::global::{
     event_context, event_value, flush, init, notify, notify_notice, request_id,
 };
 pub use crate::notice::Notice;
+#[cfg(feature = "tokio")]
+pub use crate::request_scope::{ScopeHandle, scope, scope_sync};
 pub use crate::transport::{
     CapturedRequest, RequestKind, TestTransport, Transport, TransportError, TransportRequest,
     TransportResponse,

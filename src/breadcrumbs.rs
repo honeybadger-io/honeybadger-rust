@@ -44,9 +44,12 @@ pub(crate) struct RingBuffer {
 }
 
 impl RingBuffer {
+    /// An empty trail. Deliberately allocation-free: one of these exists per
+    /// in-flight request scope, and most requests record no breadcrumbs at all.
+    /// Growth is bounded by `CAPACITY` in `push`.
     pub(crate) fn new() -> Self {
         RingBuffer {
-            buf: VecDeque::with_capacity(CAPACITY),
+            buf: VecDeque::new(),
         }
     }
 
@@ -116,5 +119,19 @@ mod tests {
         // e.g. 2026-07-22T21:03:04.123Z
         assert!(ts.ends_with('Z'));
         assert_eq!(ts.len(), "2026-07-22T21:03:04.123Z".len());
+    }
+
+    #[test]
+    fn test_ring_buffer_allocates_nothing_until_used() {
+        // One buffer per client is cheap; one per in-flight request is not. At
+        // high concurrency a 40-slot reservation per request costs megabytes
+        // that most requests never use, and all of it is waste when
+        // breadcrumbs are disabled.
+        let buf = RingBuffer::new();
+        assert_eq!(buf.buf.capacity(), 0, "an unused trail must not reserve");
+
+        let mut buf = RingBuffer::new();
+        buf.push(Breadcrumb::new("first", "custom", None));
+        assert_eq!(buf.snapshot().len(), 1, "still usable once pushed to");
     }
 }
