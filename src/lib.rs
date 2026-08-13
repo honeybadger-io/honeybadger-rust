@@ -123,6 +123,7 @@ mod global;
 mod notice;
 mod panic_hook;
 mod sanitizer;
+mod scope;
 mod transport;
 mod worker;
 

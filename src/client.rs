@@ -1,5 +1,5 @@
 //! Client: shared state + the notify pipeline (spec "Notify pipeline").
-use crate::breadcrumbs::{Breadcrumb, RingBuffer};
+use crate::breadcrumbs::Breadcrumb;
 use crate::config::Config;
 use crate::drops::DropCounter;
 use crate::error::Error;
@@ -40,13 +40,12 @@ enum EventsState {
 struct Inner {
     config: Config,
     sanitizer: Sanitizer,
-    context: Mutex<Map<String, Value>>,
-    breadcrumbs: Mutex<RingBuffer>,
+    /// This client's process-global ambient state. Task 3 puts a per-request
+    /// overlay in front of it.
+    global: Arc<crate::scope::Scope>,
     transport: Arc<dyn Transport>,
     worker: WorkerHandle,
     notice_drops: Arc<DropCounter>,
-    event_context: Mutex<Map<String, Value>>,
-    request_id: Mutex<Option<String>>,
     events: Mutex<EventsState>,
     event_drops: Arc<DropCounter>,
     sampler: Sampler,
@@ -131,6 +130,7 @@ impl Client {
 
         // 1. Assembly inputs: scope context (local wins), breadcrumbs, backtrace frames.
         let scope = inner
+            .global
             .context
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -139,6 +139,7 @@ impl Client {
         let request_id_fallback = self.current_request_id();
         let breadcrumbs = inner.config.breadcrumbs_enabled.then(|| {
             inner
+                .global
                 .breadcrumbs
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
@@ -250,7 +251,12 @@ impl Client {
         I: IntoIterator<Item = (K, Value)>,
         K: Into<String>,
     {
-        let mut ctx = self.0.context.lock().unwrap_or_else(|e| e.into_inner());
+        let mut ctx = self
+            .0
+            .global
+            .context
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for (k, v) in entries {
             let key = k.into();
             if v.is_null() {
@@ -270,11 +276,13 @@ impl Client {
     /// concurrent request handler will erase other requests' state.
     pub fn clear_context(&self) {
         self.0
+            .global
             .context
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
         self.0
+            .global
             .breadcrumbs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -299,6 +307,7 @@ impl Client {
             return;
         }
         self.0
+            .global
             .breadcrumbs
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -392,6 +401,7 @@ impl Client {
             return;
         }
         let scope = inner
+            .global
             .event_context
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -475,6 +485,7 @@ impl Client {
     {
         let mut ctx = self
             .0
+            .global
             .event_context
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -491,6 +502,7 @@ impl Client {
     /// Clears this client's event context, leaving notice context untouched.
     pub fn clear_event_context(&self) {
         self.0
+            .global
             .event_context
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -508,16 +520,27 @@ impl Client {
     /// unit of work at a time — a CLI, a cron job, a serialized consumer — and
     /// in a concurrent server put `request_id` in the event payload instead.
     pub fn request_id(&self, id: impl Into<String>) {
-        *self.0.request_id.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.into());
+        *self
+            .0
+            .global
+            .request_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(id.into());
     }
 
     /// Clears the request id set by [`Client::request_id`].
     pub fn clear_request_id(&self) {
-        *self.0.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .0
+            .global
+            .request_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub(crate) fn current_request_id(&self) -> Option<String> {
         self.0
+            .global
             .request_id
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -575,13 +598,10 @@ impl ClientBuilder {
         Ok(Client(Arc::new(Inner {
             config,
             sanitizer,
-            context: Mutex::new(Map::new()),
-            breadcrumbs: Mutex::new(RingBuffer::new()),
+            global: Arc::new(crate::scope::Scope::new()),
             transport,
             worker,
             notice_drops,
-            event_context: Mutex::new(Map::new()),
-            request_id: Mutex::new(None),
             events: Mutex::new(EventsState::NotStarted),
             event_drops: Arc::new(DropCounter::new("events")),
             sampler,
