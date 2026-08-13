@@ -68,11 +68,6 @@ jobs:
       # The panic-hook tests spawn fixture processes via nested `cargo run`, so this
       # job compiles the crate three times over; it is slower than it looks.
       - run: cargo test
-      # Insurance, not coverage: the crate declares no default features, so today
-      # this is byte-for-byte the same build as `cargo test` above and reports the
-      # same test count. It is here so that adding `default = ["tokio"]` later
-      # cannot silently stop the featureless build from being tested.
-      - run: cargo test --no-default-features
       - run: cargo test --features tokio
 
   msrv:
