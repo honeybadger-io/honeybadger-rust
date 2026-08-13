@@ -107,10 +107,32 @@ subsequent request. That is the cross-request contamination this work exists to
 remove, made permanent rather than transient.
 
 ```rust
-pub fn current_scope() -> ScopeHandle;                            // cheap, Arc clone
-pub async fn in_scope<F: Future>(h: ScopeHandle, f: F) -> F::Output;
-pub fn in_scope_sync<T>(h: ScopeHandle, f: impl FnOnce() -> T) -> T;   // spawn_blocking, threads
+pub struct ScopeHandle(/* Arc<Overlay> */);   // Clone: one atomic increment
+
+impl ScopeHandle {
+    pub fn current() -> ScopeHandle;                            // total: fresh empty one if unscoped
+    pub fn try_current() -> Option<ScopeHandle>;                // None if no scope active
+    pub async fn enter<F: Future>(self, f: F) -> F::Output;
+    pub fn enter_sync<T>(self, f: impl FnOnce() -> T) -> T;     // spawn_blocking, threads
+}
 ```
+
+**Shipped shape (reshaped before publication).** The three free functions above
+were originally `current_scope()` / `in_scope(h, f)` / `in_scope_sync(h, f)`.
+They became methods on `ScopeHandle` — the reasoning in this decision is
+unchanged; only the surface moved. Three names came off a crowded crate root, and
+the operation is discoverable from the type the caller is already holding.
+`try_current()` was added because `current()` is deliberately total, which left
+callers unable to *detect* the write-sink case this decision documents.
+
+`enter`/`enter_sync` take `self` by value, which matters for the one operation
+this API exists for. A `&self` receiver makes the future returned by `enter`
+borrow the handle, so it is not `'static` and cannot be handed to `tokio::spawn`
+at all — every headline call site would need an `async move { … .await }`
+wrapper. By value, `tokio::spawn(scope.enter(async { … }))` compiles as written.
+The cost is a visible `.clone()` when one handle is entered more than once, which
+on an `Arc` newtype is a single atomic increment — a better trade than a wrapper
+on the common path.
 
 Residual limitation, documented not solved: a `spawn` **inside a dependency**
 cannot be wrapped by the caller. Those notices land unscoped. The write-path
@@ -187,12 +209,14 @@ existing test suite working untouched.
 
 ```rust
 pub async fn scope<F: Future>(f: F) -> F::Output;
-pub fn sync_scope<T>(f: impl FnOnce() -> T) -> T;
+pub fn scope_sync<T>(f: impl FnOnce() -> T) -> T;
 ```
 
 Both shapes are needed because `tokio::task_local!` provides `scope` and
-`sync_scope` separately, and blocking handlers exist. Plus the three capture
-functions from decision 5. Feature-gated:
+`sync_scope` separately, and blocking handlers exist. (Ours is named `scope_sync`
+rather than mirroring tokio's `sync_scope`, so that the four public names read as
+two pairs with one suffix: `scope`/`scope_sync` and `enter`/`enter_sync`.) Plus
+the `ScopeHandle` capture methods from decision 5. Feature-gated:
 
 ```toml
 [features]
@@ -213,9 +237,9 @@ honeybadger::scope(async {
     honeybadger::context([("user_id", json!(42))]);
 
     // Crossing a thread boundary requires carrying the scope explicitly.
-    let scope = honeybadger::current_scope();
+    let scope = honeybadger::ScopeHandle::current();
     tokio::task::spawn_blocking(move || {
-        honeybadger::in_scope_sync(scope, || {
+        scope.enter_sync(|| {
             honeybadger::add_breadcrumb("query ran", "query", None);
             run_query()
         })
@@ -260,8 +284,9 @@ not propagate" is what the first draft got wrong.
   carries its own client's base plus the shared overlay.
 - Nesting: an inner scope inherits the outer's context and `request_id`, and
   starts a clean trail.
-- Capture: `in_scope` and `in_scope_sync` restore the overlay across
-  `tokio::spawn` and `spawn_blocking`.
+- Capture: `ScopeHandle::enter` and `enter_sync` restore the overlay across
+  `tokio::spawn` and `spawn_blocking`, and a cloned handle re-enters the same
+  overlay.
 - `clear_context` inside a scope leaves the global base intact.
 - Fallback: with no scope active, all four stores resolve to the client's global.
   The existing suite covers this by construction and must pass unmodified — that
@@ -275,9 +300,10 @@ not propagate" is what the first draft got wrong.
 1. Extract `Scope` and route the 12 access points through the read/write helpers,
    with only the global implementation. No behaviour change, no new dependency;
    the existing suite is the proof.
-2. Add the `tokio` feature, the task-local overlay, `scope()` / `sync_scope()`,
+2. Add the `tokio` feature, the task-local overlay, `scope()` / `scope_sync()`,
    merge semantics, and the concurrency and contamination tests.
-3. Add `current_scope` / `in_scope` / `in_scope_sync` and their tests.
+3. Add `ScopeHandle` with `current` / `try_current` / `enter` / `enter_sync` and
+   their tests.
 4. Rewrite the hazard documentation and add the CI feature matrix.
 
 ## Out of scope
