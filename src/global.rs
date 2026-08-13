@@ -182,6 +182,19 @@ pub fn flush(timeout: Duration) -> bool {
     global_client().map(|c| c.flush(timeout)).unwrap_or(false)
 }
 
+/// Runs `f` with a fresh request scope. See [`crate::Client::context`] for what
+/// becomes request-local. Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+pub async fn scope<F: std::future::Future>(f: F) -> F::Output {
+    crate::scope::scope(f).await
+}
+
+/// [`scope`] for synchronous code. Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+pub fn sync_scope<T>(f: impl FnOnce() -> T) -> T {
+    crate::scope::sync_scope(f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

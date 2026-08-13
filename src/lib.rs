@@ -135,6 +135,8 @@ pub use crate::global::{
     Guard, add_breadcrumb, clear_context, clear_event_context, clear_request_id, context, event,
     event_context, event_value, flush, init, notify, notify_notice, request_id,
 };
+#[cfg(feature = "tokio")]
+pub use crate::global::{scope, sync_scope};
 pub use crate::notice::Notice;
 pub use crate::transport::{
     CapturedRequest, RequestKind, TestTransport, Transport, TransportError, TransportRequest,

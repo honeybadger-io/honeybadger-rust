@@ -124,26 +124,39 @@ impl Client {
         crate::bt::capture(&self.0.config.root)
     }
 
+    /// The overlay for the current request, if a scope is active.
+    fn overlay(&self) -> Option<Arc<crate::scope::Overlay>> {
+        crate::scope::current_overlay()
+    }
+
     /// Spec pipeline steps 1–6. Returns the compressed wire payload, or None if dropped.
     fn run_pipeline(&self, mut notice: Notice) -> Option<Vec<u8>> {
         let inner = &*self.0;
 
         // 1. Assembly inputs: scope context (local wins), breadcrumbs, backtrace frames.
-        let scope = inner
-            .global
-            .context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        notice.merge_scope_context(scope);
+        let overlay = self.overlay();
+        let scope_context = crate::scope::merged_context(
+            &inner.global.context,
+            overlay.as_ref().map(|o| &o.context),
+        );
+        notice.merge_scope_context(scope_context);
         let request_id_fallback = self.current_request_id();
         let breadcrumbs = inner.config.breadcrumbs_enabled.then(|| {
-            inner
-                .global
-                .breadcrumbs
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .snapshot()
+            // Never merged: an active overlay's trail is used alone, because
+            // merging the global trail reintroduces the cross-request mixing.
+            match &overlay {
+                Some(o) => o
+                    .breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot(),
+                None => inner
+                    .global
+                    .breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .snapshot(),
+            }
         });
         let frames = match (notice.frames.take(), notice.raw_backtrace.take()) {
             (Some(frames), _) => Some(frames), // pre-processed (panic path)
@@ -251,12 +264,12 @@ impl Client {
         I: IntoIterator<Item = (K, Value)>,
         K: Into<String>,
     {
-        let mut ctx = self
-            .0
-            .global
-            .context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.context,
+            None => &self.0.global.context,
+        };
+        let mut ctx = store.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in entries {
             let key = k.into();
             if v.is_null() {
@@ -275,20 +288,33 @@ impl Client {
     /// time (a CLI, a cron job, a serialized queue consumer); calling it from a
     /// concurrent request handler will erase other requests' state.
     pub fn clear_context(&self) {
-        self.0
-            .global
-            .context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.0
-            .global
-            .breadcrumbs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
-        self.clear_event_context();
-        self.clear_request_id();
+        match self.overlay() {
+            Some(o) => {
+                o.context.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                o.breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                o.event_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *o.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+            None => {
+                let g = &self.0.global;
+                g.context.lock().unwrap_or_else(|e| e.into_inner()).clear();
+                g.breadcrumbs
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                g.event_context
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+                *g.request_id.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
     }
 
     /// Records a breadcrumb. The most recent 40 are attached to each notice; older ones
@@ -306,9 +332,12 @@ impl Client {
         if !self.0.config.breadcrumbs_enabled {
             return;
         }
-        self.0
-            .global
-            .breadcrumbs
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.breadcrumbs,
+            None => &self.0.global.breadcrumbs,
+        };
+        store
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .push(Breadcrumb::new(message, category, metadata));
@@ -400,12 +429,11 @@ impl Client {
         if !inner.config.events_enabled {
             return;
         }
-        let scope = inner
-            .global
-            .event_context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+        let overlay = self.overlay();
+        let scope = crate::scope::merged_context(
+            &inner.global.event_context,
+            overlay.as_ref().map(|o| &o.event_context),
+        );
         let request_id = self.current_request_id();
         let Some(line) = assemble_event(
             event_type,
@@ -483,12 +511,12 @@ impl Client {
         I: IntoIterator<Item = (K, Value)>,
         K: Into<String>,
     {
-        let mut ctx = self
-            .0
-            .global
-            .event_context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.event_context,
+            None => &self.0.global.event_context,
+        };
+        let mut ctx = store.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in entries {
             let key = k.into();
             if v.is_null() {
@@ -501,12 +529,12 @@ impl Client {
 
     /// Clears this client's event context, leaving notice context untouched.
     pub fn clear_event_context(&self) {
-        self.0
-            .global
-            .event_context
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.event_context,
+            None => &self.0.global.event_context,
+        };
+        store.lock().unwrap_or_else(|e| e.into_inner()).clear();
     }
 
     /// Sets the request id correlating this client's notices and events, and
@@ -520,25 +548,32 @@ impl Client {
     /// unit of work at a time — a CLI, a cron job, a serialized consumer — and
     /// in a concurrent server put `request_id` in the event payload instead.
     pub fn request_id(&self, id: impl Into<String>) {
-        *self
-            .0
-            .global
-            .request_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = Some(id.into());
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.request_id,
+            None => &self.0.global.request_id,
+        };
+        *store.lock().unwrap_or_else(|e| e.into_inner()) = Some(id.into());
     }
 
     /// Clears the request id set by [`Client::request_id`].
     pub fn clear_request_id(&self) {
-        *self
-            .0
-            .global
-            .request_id
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        let overlay = self.overlay();
+        let store = match &overlay {
+            Some(o) => &o.request_id,
+            None => &self.0.global.request_id,
+        };
+        *store.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     pub(crate) fn current_request_id(&self) -> Option<String> {
+        if let Some(o) = self.overlay() {
+            return o
+                .request_id
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+        }
         self.0
             .global
             .request_id
@@ -691,6 +726,106 @@ mod tests {
                 serde_json::from_str(&s).unwrap()
             })
             .collect()
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_concurrent_requests_do_not_share_state() {
+        // The bug this feature exists to fix. Before scoping, each notice
+        // carried whatever the global 40-entry trail happened to hold.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let client = client.clone();
+            handles.push(tokio::spawn(crate::scope::scope(async move {
+                client.request_id(format!("req-{i}"));
+                client.context([("who", json!(i))]);
+                client.add_breadcrumb(&format!("crumb-{i}"), "custom", None);
+                tokio::task::yield_now().await;
+                client.notify_notice(crate::Notice::message("Boom", "x"));
+            })));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert!(client.flush(Duration::from_secs(5)));
+
+        for notice in delivered(&transport) {
+            let who = notice["request"]["context"]["who"].as_i64().unwrap();
+            let crumbs = notice["breadcrumbs"]["trail"].as_array().unwrap();
+            assert_eq!(crumbs.len(), 1, "exactly this request's own crumb");
+            assert_eq!(crumbs[0]["message"], json!(format!("crumb-{who}")));
+            // The request-id slot lands in `correlation_context`, not
+            // `request.context` — see `assemble` in src/notice.rs.
+            assert_eq!(
+                notice["correlation_context"]["request_id"],
+                json!(format!("req-{who}")),
+                "request_id must match the same request as the context"
+            );
+        }
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_an_unscoped_spawn_does_poison_later_scopes() {
+        // The failure mode behind shipping a capture API: a child with no scope
+        // writes to the client's global store, which every later scope merges
+        // beneath itself. Left unchecked, one request's context persists into
+        // all subsequent ones.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+
+        crate::scope::scope(async {
+            let c = client.clone();
+            // Deliberately NOT wrapped in in_scope — this is the hazard.
+            tokio::spawn(async move { c.context([("leaked", json!(true))]) })
+                .await
+                .unwrap();
+        })
+        .await;
+
+        let leaked = crate::scope::scope(async {
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            assert!(client.flush(Duration::from_secs(5)));
+            delivered(&transport)[0]["request"]["context"]
+                .get("leaked")
+                .cloned()
+        })
+        .await;
+        assert_eq!(
+            leaked,
+            Some(json!(true)),
+            "documents the known hazard: an unscoped write lands in the global \
+             base and every later scope merges it. Task 4's capture API is the \
+             remedy; if this ever returns None the docs must be updated."
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_global_context_set_after_scope_entry_is_visible() {
+        // The property a snapshot-based design would have lost.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        crate::scope::scope(async {
+            client.context([("in_scope", json!(1))]);
+            // A different clone writes globally, from outside any scope.
+            let outside = client.clone();
+            std::thread::spawn(move || outside.context([("late", json!(2))]))
+                .join()
+                .unwrap();
+            client.notify_notice(crate::Notice::message("Boom", "x"));
+            assert!(client.flush(Duration::from_secs(5)));
+            let ctx = &delivered(&transport)[0]["request"]["context"];
+            assert_eq!(ctx["in_scope"], json!(1));
+            assert_eq!(ctx["late"], json!(2), "merged at read time, not copied");
+        })
+        .await;
+        client.shutdown(Duration::from_secs(5));
     }
 
     fn events_delivered(transport: &TestTransport) -> Vec<serde_json::Value> {
