@@ -9,6 +9,14 @@ name: CI
 # branches, because those branches select the toolchain by their *name*. Pinning them
 # would freeze the name away, so the toolchain moves to an explicit `toolchain:` input.
 
+# Least privilege, rather than whatever the repository default happens to be: every
+# job below only checks out the tree and runs cargo or actionlint, and `actions/
+# checkout` is the only step that uses the token at all. A future job that needs to
+# write something — a PR comment, a release, an OIDC exchange — should widen its own
+# `permissions:` block rather than this one.
+permissions:
+  contents: read
+
 on:
   push:
     branches: [main]
