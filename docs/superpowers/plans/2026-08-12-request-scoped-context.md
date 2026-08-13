@@ -1,5 +1,15 @@
 # Request-Scoped Context Implementation Plan
 
+> **Historical note — read before following any path or name below.** This plan
+> records the work as planned and executed, and is deliberately left as written.
+> The implementation was reshaped afterwards: the module it calls `src/scope.rs`
+> is now `src/request_scope.rs`, `sync_scope` is now `scope_sync`, and
+> `current_scope` / `in_scope` / `in_scope_sync` are now the `ScopeHandle`
+> methods `current` / `enter` / `enter_sync`, joined by `try_current`. See
+> decision 5 of
+> [the design spec](../specs/2026-07-31-request-scoped-context-design.md) for the
+> current shape.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Make `context`, `breadcrumbs`, `event_context`, and `request_id` request-scoped in concurrent servers, so a notice carries only its own request's state.

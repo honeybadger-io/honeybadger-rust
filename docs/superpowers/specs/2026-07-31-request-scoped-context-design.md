@@ -123,7 +123,10 @@ They became methods on `ScopeHandle` — the reasoning in this decision is
 unchanged; only the surface moved. Three names came off a crowded crate root, and
 the operation is discoverable from the type the caller is already holding.
 `try_current()` was added because `current()` is deliberately total, which left
-callers unable to *detect* the write-sink case this decision documents.
+callers unable to *detect* the detached-handle case: a handle captured with no
+scope active carries an overlay of its own, so what the spawned work records
+through it is read by that work's own notices and never by the notices of the
+code that spawned it.
 
 `enter`/`enter_sync` take `self` by value, which matters for the one operation
 this API exists for. A `&self` receiver makes the future returned by `enter`
@@ -273,9 +276,12 @@ not propagate" is what the first draft got wrong.
   carries only its own and none of its neighbours'. This is the test that would
   fail today.
 - **The contamination test:** inside a scope, spawn a task *without* capturing,
-  have it write context, then open a fresh scope and assert the write did not
-  leak into it. This pins decision 5's failure mode so a future refactor cannot
-  quietly reintroduce it.
+  have it write context, then open a fresh scope and assert the write **did**
+  leak into it. The leak is real and deliberate, exactly as decision 5 describes:
+  a child with no overlay writes to the client's global base, and every later
+  overlay merges that base beneath itself. The test therefore pins the failure
+  mode rather than a fix for it — capturing a `ScopeHandle` is the remedy — and
+  if it ever stops leaking, the hazard documentation must change with it.
 - Merge semantics: a scope sees the client's global context, does not see global
   breadcrumbs, and overlay keys win over global keys.
 - Global writes *after* a scope opens are visible inside it — the property
