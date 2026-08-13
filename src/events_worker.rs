@@ -565,6 +565,18 @@ mod tests {
     /// out after `max_retries`, so once delivery stops it has stopped for
     /// good — polling for quiescence finds the final count without assuming
     /// how long a contended runner takes to reach it.
+    ///
+    /// Zero is never accepted as settled, even after `grace` elapses with no
+    /// change: `attempts_for`'s single call site enqueues exactly one event
+    /// at `batch_size: 1`, which guarantees at least one delivery attempt, so
+    /// an observed count of zero can only mean the worker thread has not run
+    /// yet — the exact starvation a contended runner produces — not that it
+    /// settled at zero. Without this guard, a worker merely slow to be
+    /// scheduled would read as "settled at 0" once `grace` passed, which is
+    /// the same class of spurious failure this helper exists to remove. The
+    /// outer `deadline` still catches a genuinely dead worker: it keeps
+    /// waiting past `grace` while `last == 0`, and only returns 0 — correctly
+    /// failing the assertion — once `timeout` is exhausted.
     fn settled_request_count(transport: &TestTransport, timeout: Duration) -> usize {
         let grace = Duration::from_millis(800);
         let deadline = Instant::now() + timeout;
@@ -576,7 +588,7 @@ mod tests {
             if now != last {
                 last = now;
                 stable_since = Instant::now();
-            } else if stable_since.elapsed() >= grace {
+            } else if last > 0 && stable_since.elapsed() >= grace {
                 return last;
             }
             if Instant::now() >= deadline {
