@@ -541,6 +541,50 @@ mod tests {
         spawn(transport, cfg, Arc::new(DropCounter::new("events"))).unwrap()
     }
 
+    /// Polls `cond` until it returns true, or gives up after `timeout` and
+    /// returns false. Turns "sleep a fixed amount, then assert it happened"
+    /// into a bound that holds under any scheduling: a slow, contended
+    /// runner just takes a little longer to observe the condition, rather
+    /// than failing an assertion that a faster box would have passed.
+    fn poll_until(timeout: Duration, mut cond: impl FnMut() -> bool) -> bool {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if cond() {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// Waits for `transport`'s request count to stop changing for a full
+    /// `grace` window, or gives up after `timeout`. Every status
+    /// `attempts_for` is used with either drops the batch outright or ages it
+    /// out after `max_retries`, so once delivery stops it has stopped for
+    /// good — polling for quiescence finds the final count without assuming
+    /// how long a contended runner takes to reach it.
+    fn settled_request_count(transport: &TestTransport, timeout: Duration) -> usize {
+        let grace = Duration::from_millis(800);
+        let deadline = Instant::now() + timeout;
+        let mut last = transport.requests().len();
+        let mut stable_since = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(10));
+            let now = transport.requests().len();
+            if now != last {
+                last = now;
+                stable_since = Instant::now();
+            } else if stable_since.elapsed() >= grace {
+                return last;
+            }
+            if Instant::now() >= deadline {
+                return last;
+            }
+        }
+    }
+
     #[test]
     fn test_count_trigger_cuts_a_batch() {
         let transport = Arc::new(TestTransport::new());
@@ -548,8 +592,14 @@ mod tests {
         for i in 0..3 {
             assert!(w.try_enqueue(format!("{{\"n\":{i}}}")));
         }
-        // The third event fills the batch, so delivery happens without a flush.
-        std::thread::sleep(Duration::from_millis(300));
+        // The third event fills the batch, so delivery happens without a
+        // flush. Poll rather than sleep a fixed amount: only three events
+        // were ever enqueued, so once one batch of them ships, no further
+        // request can ever arrive — there is nothing to race against.
+        assert!(
+            poll_until(Duration::from_secs(5), || !transport.requests().is_empty()),
+            "the full batch must ship without a flush"
+        );
         let batches = lines(&transport);
         assert_eq!(batches.len(), 1);
         assert_eq!(batches[0].len(), 3, "one batch of exactly batch_size");
@@ -559,18 +609,36 @@ mod tests {
     #[test]
     fn test_time_trigger_starts_with_the_batch_not_the_last_send() {
         let transport = Arc::new(TestTransport::new());
-        let w = worker(transport.clone(), cfg());
+        // A longer-than-usual interval so the "must not have shipped yet"
+        // check below can sit at a small fraction of it — generous enough to
+        // survive a 3x scheduling slowdown — while still keeping the test
+        // fast in the common case.
+        let interval = Duration::from_millis(600);
+        let w = worker(
+            transport.clone(),
+            EventsConfig {
+                flush_interval: interval,
+                ..cfg()
+            },
+        );
         // Idle well past the interval, then send a single event. If the
         // deadline ran "since the last send" it would already have expired and
-        // this would ship immediately as a batch of one.
-        std::thread::sleep(Duration::from_millis(500));
+        // this would ship immediately as a batch of one. Sleeping longer than
+        // necessary here is always safe: it only makes the idle period more
+        // convincing, never less.
+        std::thread::sleep(interval * 2);
         assert!(w.try_enqueue("{\"n\":1}".into()));
-        std::thread::sleep(Duration::from_millis(80));
+        // Check at 1/6 of the interval: even a 3x scheduling slowdown only
+        // pushes this to half the interval, well short of the deadline.
+        std::thread::sleep(interval / 6);
         assert!(
             transport.requests().is_empty(),
             "a fresh batch must get a full interval, not a stale deadline"
         );
-        std::thread::sleep(Duration::from_millis(300));
+        assert!(
+            poll_until(Duration::from_secs(5), || !lines(&transport).is_empty()),
+            "the batch must ship once the interval elapses"
+        );
         assert_eq!(lines(&transport).len(), 1);
         w.shutdown(Duration::from_secs(5));
     }
@@ -591,9 +659,8 @@ mod tests {
         for _ in 0..100 {
             w.try_enqueue(big.clone());
         }
-        std::thread::sleep(Duration::from_millis(500));
         assert!(
-            !transport.requests().is_empty(),
+            poll_until(Duration::from_secs(5), || !transport.requests().is_empty()),
             "the byte ceiling must cut a batch on its own"
         );
         w.shutdown(Duration::from_secs(5));
@@ -653,8 +720,11 @@ mod tests {
             },
         );
         w.try_enqueue("{\"n\":1}".into());
-        std::thread::sleep(Duration::from_millis(600));
-        let n = transport.requests().len();
+        // Every status this is used with either drops the batch on the first
+        // response or ages it out after max_retries: wait for the count to
+        // go quiet rather than assuming how long that takes on a contended
+        // runner.
+        let n = settled_request_count(&transport, Duration::from_secs(5));
         w.shutdown(Duration::from_secs(5));
         n
     }
@@ -681,8 +751,11 @@ mod tests {
         // retrying every flush interval until midnight, at exactly the rate that
         // provoked the limit.
         let transport = Arc::new(TestTransport::new());
+        // A Retry-After well past the check point below: even a 3x scheduling
+        // slowdown on that sleep cannot push it past a 5s deadline.
+        let retry_after = Duration::from_secs(5);
         for _ in 0..20 {
-            transport.respond_with_retry_after(429, Duration::from_secs(2));
+            transport.respond_with_retry_after(429, retry_after);
         }
         let w = worker(
             transport.clone(),
@@ -693,11 +766,11 @@ mod tests {
             },
         );
         w.try_enqueue("{\"n\":1}".into());
-        std::thread::sleep(Duration::from_millis(700));
+        std::thread::sleep(Duration::from_millis(600));
         assert_eq!(
             transport.requests().len(),
             1,
-            "Retry-After said 2s; the curve alone would have retried by now"
+            "Retry-After said 5s; the curve alone would have retried by now"
         );
         w.shutdown(Duration::from_secs(2));
     }
@@ -710,11 +783,14 @@ mod tests {
         for _ in 0..200 {
             transport.respond_with_retry_after(429, Duration::ZERO);
         }
+        // A generous interval so the check point below can sit at a small
+        // fraction of it — comfortably surviving a 3x scheduling slowdown.
+        let flush_interval = Duration::from_millis(900);
         let w = worker(
             transport.clone(),
             EventsConfig {
                 batch_size: 1,
-                flush_interval: Duration::from_millis(400),
+                flush_interval,
                 ..cfg()
             },
         );
@@ -730,12 +806,35 @@ mod tests {
 
     #[test]
     fn test_429_burns_no_retry_budget_but_503_does() {
-        // A rate limit is an instruction to wait, not a failure, so it must not
-        // age a batch out. A 503 carries no such instruction.
-        assert!(
-            attempts_for(429) > 3,
-            "429 keeps retrying past max_retries + 1"
+        // A rate limit is an instruction to wait, not a failure, so it must
+        // not age a batch out — it must keep retrying long past
+        // max_retries + 1 attempts, however slowly the runner schedules it.
+        // This is a bound ("eventually exceeds the burn-budget ceiling"), not
+        // a count of how many attempts fit inside a fixed sleep: the backoff
+        // curve grows with each attempt, so a contended runner gets *fewer*
+        // attempts in the same wall-clock window, which is exactly what made
+        // the old fixed-window version flaky.
+        let transport = Arc::new(TestTransport::new());
+        for _ in 0..30 {
+            transport.respond_with(429);
+        }
+        let w = worker(
+            transport.clone(),
+            EventsConfig {
+                batch_size: 1,
+                flush_interval: Duration::from_millis(50),
+                max_retries: 2, // 3 attempts would be the burn-budget ceiling
+                ..cfg()
+            },
         );
+        w.try_enqueue("{\"n\":1}".into());
+        assert!(
+            poll_until(Duration::from_secs(10), || transport.requests().len() > 3),
+            "429 must keep retrying past max_retries + 1, however long that takes"
+        );
+        w.shutdown(Duration::from_secs(5));
+
+        // A 503 carries no such instruction and burns the budget on schedule.
         assert_eq!(attempts_for(503), 3, "503 burns the retry budget");
     }
 
@@ -803,9 +902,17 @@ mod tests {
             },
         );
         w.try_enqueue("{\"n\":1}".into());
-        std::thread::sleep(Duration::from_millis(250));
+        // Wait for the first batch to actually be delivered (and hit the
+        // 401) before sending the second — otherwise this proves nothing
+        // about suspension, since an unprocessed second event would look
+        // identical whether or not suspend logic exists.
+        assert!(
+            poll_until(Duration::from_secs(5), || !transport.requests().is_empty()),
+            "the first batch must be delivered before suspend can be observed"
+        );
         w.try_enqueue("{\"n\":2}".into());
-        std::thread::sleep(Duration::from_millis(250));
+        // suspend_interval defaults to 30s in cfg(), so there is no risk of
+        // the second batch sneaking out before this assertion runs.
         assert_eq!(
             transport.requests().len(),
             1,
@@ -838,8 +945,11 @@ mod tests {
             w.try_enqueue(format!("{{\"n\":{i}}}"));
             std::thread::sleep(Duration::from_millis(5));
         }
+        // The pacing above should already have let shedding happen well
+        // before the loop finished; poll rather than check immediately so a
+        // worker that fell behind on a contended runner still gets credit.
         assert!(
-            drops.pending() > 0,
+            poll_until(Duration::from_secs(5), || drops.pending() > 0),
             "the budget must shed data rather than grow without bound"
         );
         w.shutdown(Duration::from_secs(5));
@@ -948,11 +1058,14 @@ mod tests {
         for _ in 0..50 {
             transport.respond_with(429);
         }
+        // A generous interval so the check point below can sit at a small
+        // fraction of it — comfortably surviving a 3x scheduling slowdown.
+        let flush_interval = Duration::from_millis(1000);
         let w = worker(
             transport.clone(),
             EventsConfig {
                 batch_size: 1, // every event cuts a batch
-                flush_interval: Duration::from_millis(400),
+                flush_interval,
                 ..cfg()
             },
         );
