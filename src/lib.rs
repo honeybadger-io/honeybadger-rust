@@ -102,9 +102,10 @@
 //!
 //! The scope does not cross a `tokio::spawn`, `spawn_blocking`, or
 //! `std::thread::spawn` boundary on its own; see `scope()`'s own documentation
-//! (built with `--features tokio`) for how to carry it across explicitly with
-//! `current_scope()` and `in_scope`/`in_scope_sync`, and
-//! `examples/scoped_request.rs` for a complete, runnable walkthrough.
+//! (built with `--features tokio`) for how to carry it across explicitly by
+//! capturing a `ScopeHandle::current()` and re-entering it with
+//! `ScopeHandle::enter`/`enter_sync`, and `examples/scoped_request.rs` for a
+//! complete, runnable walkthrough.
 //!
 //! # Insights events
 //!
@@ -160,8 +161,12 @@ mod events_worker;
 mod global;
 mod notice;
 mod panic_hook;
+// Named `request_scope`, not `scope`, so that `crate::scope` in an intra-doc link
+// unambiguously means the re-exported `scope` function rather than colliding with
+// a module of the same name — an error under `--document-private-items`. The
+// module name is private, so callers never see it.
+mod request_scope;
 mod sanitizer;
-mod scope;
 mod transport;
 mod worker;
 
@@ -173,11 +178,9 @@ pub use crate::global::{
     Guard, add_breadcrumb, clear_context, clear_event_context, clear_request_id, context, event,
     event_context, event_value, flush, init, notify, notify_notice, request_id,
 };
-#[cfg(feature = "tokio")]
-pub use crate::global::{current_scope, in_scope, in_scope_sync, scope, sync_scope};
 pub use crate::notice::Notice;
 #[cfg(feature = "tokio")]
-pub use crate::scope::ScopeHandle;
+pub use crate::request_scope::{ScopeHandle, scope, scope_sync};
 pub use crate::transport::{
     CapturedRequest, RequestKind, TestTransport, Transport, TransportError, TransportRequest,
     TransportResponse,

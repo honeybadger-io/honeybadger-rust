@@ -44,7 +44,7 @@ struct Inner {
     /// overlay is read on top of, and the destination for writes made with no
     /// scope active. Not shared: `Client` is already `Arc<Inner>`, and the thing
     /// requests share is the `Arc<Overlay>` in the task-local.
-    global: crate::scope::Scope,
+    global: crate::request_scope::Scope,
     transport: Arc<dyn Transport>,
     worker: WorkerHandle,
     notice_drops: Arc<DropCounter>,
@@ -127,8 +127,8 @@ impl Client {
     }
 
     /// The overlay for the current request, if a scope is active.
-    fn overlay(&self) -> Option<Arc<crate::scope::Overlay>> {
-        crate::scope::current_overlay()
+    fn overlay(&self) -> Option<Arc<crate::request_scope::Overlay>> {
+        crate::request_scope::current_overlay()
     }
 
     /// Spec pipeline steps 1–6. Returns the compressed wire payload, or None if dropped.
@@ -137,7 +137,7 @@ impl Client {
 
         // 1. Assembly inputs: scope context (local wins), breadcrumbs, backtrace frames.
         let overlay = self.overlay();
-        let scope_context = crate::scope::merged_context(
+        let scope_context = crate::request_scope::merged_context(
             &inner.global.context,
             overlay.as_ref().map(|o| &o.context),
         );
@@ -438,7 +438,7 @@ impl Client {
             return;
         }
         let overlay = self.overlay();
-        let scope = crate::scope::merged_context(
+        let scope = crate::request_scope::merged_context(
             &inner.global.event_context,
             overlay.as_ref().map(|o| &o.event_context),
         );
@@ -656,7 +656,7 @@ impl ClientBuilder {
         Ok(Client(Arc::new(Inner {
             config,
             sanitizer,
-            global: crate::scope::Scope::new(),
+            global: crate::request_scope::Scope::new(),
             transport,
             worker,
             notice_drops,
@@ -762,7 +762,7 @@ mod tests {
         let mut handles = Vec::new();
         for i in 0..8 {
             let client = client.clone();
-            handles.push(tokio::spawn(crate::scope::scope(async move {
+            handles.push(tokio::spawn(crate::request_scope::scope(async move {
                 client.request_id(format!("req-{i}"));
                 client.context([("who", json!(i))]);
                 client.add_breadcrumb(&format!("crumb-{i}"), "custom", None);
@@ -815,7 +815,7 @@ mod tests {
         let client = test_client(transport.clone());
         client.request_id("req-global");
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             // This scope sets no request_id of its own.
             client.notify_notice(crate::Notice::message("Boom", "x"));
             client.event("scoped.event", json!({}));
@@ -823,7 +823,7 @@ mod tests {
         })
         .await;
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             client.request_id("req-scoped");
             client.notify_notice(crate::Notice::message("Boom", "y"));
             client.event("own.event", json!({}));
@@ -865,16 +865,16 @@ mod tests {
         let transport = Arc::new(TestTransport::new());
         let client = test_client(transport.clone());
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             let c = client.clone();
-            // Deliberately NOT wrapped in in_scope — this is the hazard.
+            // Deliberately NOT re-entered with ScopeHandle::enter — the hazard.
             tokio::spawn(async move { c.context([("leaked", json!(true))]) })
                 .await
                 .unwrap();
         })
         .await;
 
-        let leaked = crate::scope::scope(async {
+        let leaked = crate::request_scope::scope(async {
             client.notify_notice(crate::Notice::message("Boom", "x"));
             assert!(client.flush(Duration::from_secs(5)));
             delivered(&transport)[0]["request"]["context"]
@@ -887,7 +887,7 @@ mod tests {
             Some(json!(true)),
             "documents the known hazard: an unscoped write lands in the global \
              base and every later scope merges it. Capturing the scope with \
-             current_scope()/in_scope() is the remedy; if this ever returns \
+             ScopeHandle::current()/enter() is the remedy; if this ever returns \
              None the docs must be updated."
         );
         client.shutdown(Duration::from_secs(5));
@@ -899,7 +899,7 @@ mod tests {
         // The property a snapshot-based design would have lost.
         let transport = Arc::new(TestTransport::new());
         let client = test_client(transport.clone());
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             client.context([("in_scope", json!(1))]);
             // A different clone writes globally, from outside any scope.
             let outside = client.clone();
@@ -926,7 +926,7 @@ mod tests {
         let client = test_client(transport.clone());
         client.add_breadcrumb("global-crumb", "custom", None);
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             client.add_breadcrumb("scoped-crumb", "custom", None);
             client.notify_notice(crate::Notice::message("Boom", "x"));
             assert!(client.flush(Duration::from_secs(5)));
@@ -960,7 +960,7 @@ mod tests {
         client.event_context([("global_event_key", json!("ge"))]);
         client.request_id("req-global");
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             client.context([("scoped_key", json!("s"))]);
             client.add_breadcrumb("scoped-crumb", "custom", None);
             client.event_context([("scoped_event_key", json!("se"))]);
@@ -1072,7 +1072,7 @@ mod tests {
         let client = test_client(transport.clone());
         client.event_context([("tenant", json!("global")), ("shared", json!("global"))]);
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             client.event_context([("shared", json!("overlay"))]);
             client.request_id("req-scoped");
             client.event("user.created", json!({ "user_id": 7 }));
@@ -1123,7 +1123,7 @@ mod tests {
         let client = test_client(transport.clone());
         client.event_context([("global_key", json!("g"))]);
 
-        crate::scope::scope(async {
+        crate::request_scope::scope(async {
             client.event_context([("overlay_key", json!("o"))]);
             client.clear_event_context();
             client.event("scoped.event", json!({}));

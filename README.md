@@ -116,8 +116,8 @@ stores do not all resolve the same way:
 
 The scope does not cross a `tokio::spawn`, `tokio::task::spawn_blocking`, or
 `std::thread::spawn` boundary on its own — capture it with
-`honeybadger::current_scope()` and re-enter it on the other side with
-`honeybadger::in_scope`/`in_scope_sync`. See the
+`honeybadger::ScopeHandle::current()` and re-enter it on the other side with
+`ScopeHandle::enter`/`enter_sync`. See the
 [`scope` docs](https://docs.rs/honeybadger) (built with `--features tokio`) for the
 full explanation, including the one case no API can fix — a `spawn` inside a
 third-party dependency — and `examples/scoped_request.rs` for a complete, runnable

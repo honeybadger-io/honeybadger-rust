@@ -57,6 +57,16 @@ async fn test_the_public_facade_reports_scoped_state() {
         honeybadger::request_id("req-facade");
         honeybadger::context([("user_id", json!(7))]);
         honeybadger::add_breadcrumb("query ran", "query", None);
+
+        // The capture API through the public surface: a crumb recorded across a
+        // thread boundary still belongs to this request.
+        let scope = honeybadger::ScopeHandle::current();
+        tokio::task::spawn_blocking(move || {
+            scope.enter_sync(|| honeybadger::add_breadcrumb("blocking work", "custom", None))
+        })
+        .await
+        .unwrap();
+
         honeybadger::notify(&std::io::Error::other("boom"));
         assert!(honeybadger::flush(Duration::from_secs(10)));
     })
@@ -82,8 +92,13 @@ async fn test_the_public_facade_reports_scoped_state() {
     let crumbs = notice["breadcrumbs"]["trail"].as_array().unwrap();
     assert_eq!(
         crumbs.len(),
-        1,
+        2,
         "the scope's own trail alone — the process-wide `booted` crumb is not merged"
     );
     assert_eq!(crumbs[0]["message"], json!("query ran"));
+    assert_eq!(
+        crumbs[1]["message"],
+        json!("blocking work"),
+        "the crumb a re-entered ScopeHandle recorded off-thread"
+    );
 }

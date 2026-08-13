@@ -23,9 +23,9 @@ async fn main() {
             honeybadger::add_breadcrumb("query ran", "query", None);
 
             // Crossing a thread boundary needs the scope carried explicitly.
-            let scope = honeybadger::current_scope();
+            let scope = honeybadger::ScopeHandle::current();
             tokio::task::spawn_blocking(move || {
-                honeybadger::in_scope_sync(scope, || {
+                scope.enter_sync(|| {
                     honeybadger::add_breadcrumb("blocking work", "custom", None);
                 })
             })
