@@ -281,7 +281,10 @@ tokio = ["dep:tokio"]
 Also add `tokio` with `features = ["rt", "macros"]` to `[dev-dependencies]` so tests can use `#[tokio::test]`:
 
 ```toml
-tokio = { version = "1", default-features = false, features = ["rt", "macros"] }
+# `rt-multi-thread` is required by `#[tokio::test(flavor = "multi_thread")]`,
+# which the concurrency test in step 8 uses — without it that attribute fails
+# to compile.
+tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
 ```
 
 - [ ] **Step 2: Write the failing tests**
@@ -711,7 +714,7 @@ Add to the `mod tests` block in `src/client.rs`:
 
     #[cfg(feature = "tokio")]
     #[tokio::test]
-    async fn test_an_unscoped_spawn_cannot_poison_later_scopes() {
+    async fn test_an_unscoped_spawn_does_poison_later_scopes() {
         // The failure mode behind shipping a capture API: a child with no scope
         // writes to the client's global store, which every later scope merges
         // beneath itself. Left unchecked, one request's context persists into
@@ -1112,13 +1115,11 @@ async fn main() {
 }
 ```
 
-- [ ] **Step 4: Verify the example compiles and runs**
+- [ ] **Step 4: Gate the example on the feature**
 
-Run: `cargo run --features tokio --example scoped_request`
-Expected: prints the final line. Reporting goes to the null transport because `env` is `development` with `exclude_envs` emptied — no network required.
-
-Run: `cargo build --examples`
-Expected: PASS. The example is `tokio`-gated, so confirm it is skipped rather than broken in the default build by adding to `Cargo.toml`:
+The example calls `honeybadger::scope`, which does not exist without the feature,
+so `cargo build --examples` on the default build would fail to compile it. Add to
+`Cargo.toml` **before** building:
 
 ```toml
 [[example]]
@@ -1126,7 +1127,15 @@ name = "scoped_request"
 required-features = ["tokio"]
 ```
 
-- [ ] **Step 5: Add the CI feature matrix**
+- [ ] **Step 5: Verify the example compiles and runs**
+
+Run: `cargo run --features tokio --example scoped_request`
+Expected: prints the final line. Reporting goes to the null transport because `env` is `development` with `exclude_envs` emptied — no network required.
+
+Run: `cargo build --examples`
+Expected: PASS, with `scoped_request` skipped rather than attempted — that is what the `required-features` stanza buys.
+
+- [ ] **Step 6: Add the CI feature matrix**
 
 In `.github/workflows/ci.yml`, add two `run` steps to the `test` job after the existing `cargo test`:
 
@@ -1142,7 +1151,7 @@ And in the `lint` job, after the existing clippy line:
       - run: cargo clippy --all-targets --features tokio -- -D warnings
 ```
 
-- [ ] **Step 6: Full verification**
+- [ ] **Step 7: Full verification**
 
 ```bash
 cargo test && cargo test --features tokio && cargo test --no-default-features
@@ -1155,7 +1164,7 @@ cargo +1.88 check --all-targets
 
 Expected: all pass.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add src/client.rs src/lib.rs README.md examples/scoped_request.rs Cargo.toml .github/workflows/ci.yml
