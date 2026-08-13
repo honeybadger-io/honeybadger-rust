@@ -23,14 +23,26 @@ async fn main() {
             honeybadger::add_breadcrumb("query ran", "query", None);
 
             // Crossing a thread boundary needs the scope carried explicitly.
+            // `enter`/`enter_sync` consume the handle, so the spawned work owns
+            // it; clone the handle when you need it more than once.
             let scope = honeybadger::ScopeHandle::current();
-            tokio::task::spawn_blocking(move || {
-                scope.enter_sync(|| {
-                    honeybadger::add_breadcrumb("blocking work", "custom", None);
-                })
+            tokio::task::spawn_blocking({
+                let scope = scope.clone();
+                move || {
+                    scope.enter_sync(|| {
+                        honeybadger::add_breadcrumb("blocking work", "custom", None);
+                    })
+                }
             })
             .await
             .expect("blocking task");
+
+            // The async form goes straight to tokio::spawn — no wrapper needed.
+            tokio::spawn(scope.enter(async {
+                honeybadger::add_breadcrumb("cache warmed", "custom", None);
+            }))
+            .await
+            .expect("spawned task");
 
             honeybadger::notify_notice(honeybadger::Notice::message(
                 "Example",
@@ -42,5 +54,5 @@ async fn main() {
         r.await.expect("request");
     }
 
-    println!("three requests reported, each with only its own two breadcrumbs");
+    println!("three requests reported, each with only its own three breadcrumbs");
 }

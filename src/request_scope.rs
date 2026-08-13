@@ -216,9 +216,11 @@ pub fn scope_sync<T>(f: impl FnOnce() -> T) -> T {
 /// Requires the `tokio` feature.
 ///
 /// Obtained from [`ScopeHandle::current`] (or [`ScopeHandle::try_current`]) and
-/// re-entered with [`ScopeHandle::enter`] or [`ScopeHandle::enter_sync`]. Cheap
-/// to clone — it shares the request's state rather than copying it, so anything
-/// recorded through it reaches the request that captured it.
+/// re-entered with [`ScopeHandle::enter`] or [`ScopeHandle::enter_sync`], each of
+/// which consumes it so the work it is handed to can own it. Cheap to clone — it
+/// shares the request's state rather than copying it, so anything recorded through
+/// any clone reaches the request that captured it, and cloning is what you do to
+/// enter the same scope twice.
 #[cfg(feature = "tokio")]
 #[derive(Clone)]
 pub struct ScopeHandle(Arc<Overlay>);
@@ -294,32 +296,43 @@ impl ScopeHandle {
     /// request. A scope already active on this task is replaced for the duration
     /// of `f`, not merged with the handle's.
     ///
-    /// Takes `&self`, so one handle can be re-entered as often as you like — in
-    /// a loop, or from several spawned tasks after cloning it. The returned
-    /// future therefore borrows the handle, so it cannot be handed straight to
-    /// [`tokio::spawn`], which requires `'static`: move the handle into the
-    /// spawned future and await `enter` inside it.
+    /// Consumes the handle, so the returned future owns it and can be handed
+    /// straight to [`tokio::spawn`], which requires `'static`:
     ///
     /// ```rust,no_run
     /// # #[cfg(feature = "tokio")]
     /// # async fn handler() {
     /// let scope = honeybadger::ScopeHandle::current();
-    /// tokio::spawn(async move {
-    ///     scope
-    ///         .enter(async {
-    ///             // still recorded against the request that captured `scope`:
-    ///             honeybadger::add_breadcrumb("cache warmed", "custom", None);
-    ///         })
-    ///         .await
-    /// })
+    /// tokio::spawn(scope.enter(async {
+    ///     // still recorded against the request that captured `scope`:
+    ///     honeybadger::add_breadcrumb("cache warmed", "custom", None);
+    /// }))
     /// .await
     /// .unwrap();
     /// # }
     /// ```
     ///
+    /// To re-enter the same scope more than once, clone the handle — it is an
+    /// [`Arc`] newtype, so a clone is one atomic increment and every clone shares
+    /// the one request's state:
+    ///
+    /// ```rust,no_run
+    /// # #[cfg(feature = "tokio")]
+    /// # async fn handler() {
+    /// let scope = honeybadger::ScopeHandle::current();
+    /// for shard in 0..3 {
+    ///     tokio::spawn(scope.clone().enter(async move {
+    ///         honeybadger::add_breadcrumb(&format!("shard {shard} queried"), "query", None);
+    ///     }))
+    ///     .await
+    ///     .unwrap();
+    /// }
+    /// # }
+    /// ```
+    ///
     /// See [`scope`] for the `spawn_blocking` counterpart.
-    pub async fn enter<F: Future>(&self, f: F) -> F::Output {
-        CURRENT.scope(Arc::clone(&self.0), f).await
+    pub async fn enter<F: Future>(self, f: F) -> F::Output {
+        CURRENT.scope(self.0, f).await
     }
 
     /// [`enter`](Self::enter) for synchronous work — a
@@ -328,9 +341,10 @@ impl ScopeHandle {
     /// The common case, and the reason the capture API exists: synchronous
     /// database drivers run on `spawn_blocking`, and "query ran" is the canonical
     /// breadcrumb. Same share-not-copy semantics as [`enter`](Self::enter), and
-    /// likewise takes `&self`; see [`scope`] for the worked example.
-    pub fn enter_sync<T>(&self, f: impl FnOnce() -> T) -> T {
-        CURRENT.sync_scope(Arc::clone(&self.0), f)
+    /// likewise consumes the handle — clone it to use it again; see [`scope`] for
+    /// the worked example.
+    pub fn enter_sync<T>(self, f: impl FnOnce() -> T) -> T {
+        CURRENT.sync_scope(self.0, f)
     }
 }
 
@@ -455,21 +469,17 @@ mod tests {
             let o = current_overlay().unwrap();
             set(&o.context, "who", json!("parent"));
             let handle = ScopeHandle::current();
-            // `enter` borrows the handle, so a spawned future owns it via the
-            // enclosing `async move` rather than being handed to spawn directly.
-            tokio::spawn(async move {
-                handle
-                    .enter(async {
-                        current_overlay()
-                            .unwrap()
-                            .context
-                            .lock()
-                            .unwrap()
-                            .get("who")
-                            .cloned()
-                    })
-                    .await
-            })
+            // `enter` consumes the handle, so the future owns it and goes
+            // straight to spawn — the idiom users should copy.
+            tokio::spawn(handle.enter(async {
+                current_overlay()
+                    .unwrap()
+                    .context
+                    .lock()
+                    .unwrap()
+                    .get("who")
+                    .cloned()
+            }))
             .await
             .unwrap()
         })
@@ -509,18 +519,14 @@ mod tests {
         // recorded in a spawned task reaches the parent request's notice.
         scope(async {
             let handle = ScopeHandle::current();
-            tokio::spawn(async move {
-                handle
-                    .enter(async {
-                        current_overlay()
-                            .unwrap()
-                            .breadcrumbs
-                            .lock()
-                            .unwrap()
-                            .push(crate::breadcrumbs::Breadcrumb::new("child", "custom", None));
-                    })
-                    .await
-            })
+            tokio::spawn(handle.enter(async {
+                current_overlay()
+                    .unwrap()
+                    .breadcrumbs
+                    .lock()
+                    .unwrap()
+                    .push(crate::breadcrumbs::Breadcrumb::new("child", "custom", None));
+            }))
             .await
             .unwrap();
             let crumbs = current_overlay()
@@ -566,13 +572,9 @@ mod tests {
         // Same sharing semantics — a write through the handle reaches the scope.
         scope(async {
             let handle = ScopeHandle::try_current().unwrap();
-            tokio::spawn(async move {
-                handle
-                    .enter(async {
-                        set(&current_overlay().unwrap().context, "who", json!("child"));
-                    })
-                    .await
-            })
+            tokio::spawn(handle.enter(async {
+                set(&current_overlay().unwrap().context, "who", json!("child"));
+            }))
             .await
             .unwrap();
             assert_eq!(
@@ -589,13 +591,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_a_handle_can_be_entered_more_than_once() {
-        // `enter`/`enter_sync` take &self, so a handle is reusable in a loop
-        // without cloning.
+    async fn test_a_cloned_handle_enters_the_same_scope_again() {
+        // `enter`/`enter_sync` consume the handle so spawned work can own it;
+        // cloning is how you enter the same scope twice, and every clone shares
+        // the one overlay.
         scope(async {
             let handle = ScopeHandle::current();
             for i in 0..3 {
                 handle
+                    .clone()
                     .enter(async move {
                         current_overlay().unwrap().breadcrumbs.lock().unwrap().push(
                             crate::breadcrumbs::Breadcrumb::new(
@@ -606,7 +610,9 @@ mod tests {
                         );
                     })
                     .await;
-                handle.enter_sync(|| assert!(current_overlay().is_some()));
+                handle
+                    .clone()
+                    .enter_sync(|| assert!(current_overlay().is_some()));
             }
             assert_eq!(
                 current_overlay()
