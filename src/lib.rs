@@ -136,8 +136,10 @@ pub use crate::global::{
     event_context, event_value, flush, init, notify, notify_notice, request_id,
 };
 #[cfg(feature = "tokio")]
-pub use crate::global::{scope, sync_scope};
+pub use crate::global::{current_scope, in_scope, in_scope_sync, scope, sync_scope};
 pub use crate::notice::Notice;
+#[cfg(feature = "tokio")]
+pub use crate::scope::ScopeHandle;
 pub use crate::transport::{
     CapturedRequest, RequestKind, TestTransport, Transport, TransportError, TransportRequest,
     TransportResponse,

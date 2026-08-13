@@ -195,6 +195,27 @@ pub fn sync_scope<T>(f: impl FnOnce() -> T) -> T {
     crate::scope::sync_scope(f)
 }
 
+/// Captures the current request scope. Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+pub fn current_scope() -> crate::scope::ScopeHandle {
+    crate::scope::current_scope()
+}
+
+/// Runs `f` inside a captured scope. Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+pub async fn in_scope<F: std::future::Future>(
+    handle: crate::scope::ScopeHandle,
+    f: F,
+) -> F::Output {
+    crate::scope::in_scope(handle, f).await
+}
+
+/// [`in_scope`] for synchronous work. Requires the `tokio` feature.
+#[cfg(feature = "tokio")]
+pub fn in_scope_sync<T>(handle: crate::scope::ScopeHandle, f: impl FnOnce() -> T) -> T {
+    crate::scope::in_scope_sync(handle, f)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -137,6 +137,40 @@ pub fn sync_scope<T>(f: impl FnOnce() -> T) -> T {
     CURRENT.sync_scope(Arc::new(Overlay::seeded_from_current()), f)
 }
 
+/// A captured request scope, for carrying across a thread or task boundary.
+///
+/// Obtained from [`crate::current_scope`] and handed to [`crate::in_scope`] or
+/// [`crate::in_scope_sync`]. Cheap to clone — it shares the overlay rather than
+/// copying it, so state recorded in the spawned work reaches the original request.
+#[cfg(feature = "tokio")]
+#[derive(Clone)]
+pub struct ScopeHandle(Arc<Overlay>);
+
+/// Captures the current request scope, or a fresh empty one when none is active.
+///
+/// Total by design: an unscoped caller gets a usable handle rather than an
+/// `Option` to unwrap on a path that is often error handling already.
+#[cfg(feature = "tokio")]
+pub fn current_scope() -> ScopeHandle {
+    ScopeHandle(match current_overlay() {
+        Some(overlay) => overlay,
+        None => Arc::new(Overlay::seeded_from_current()),
+    })
+}
+
+/// Runs `f` inside a captured scope. The remedy for `tokio::spawn` losing it.
+#[cfg(feature = "tokio")]
+pub async fn in_scope<F: Future>(handle: ScopeHandle, f: F) -> F::Output {
+    CURRENT.scope(handle.0, f).await
+}
+
+/// [`in_scope`] for synchronous work — a `spawn_blocking` closure or a
+/// `std::thread::spawn` body.
+#[cfg(feature = "tokio")]
+pub fn in_scope_sync<T>(handle: ScopeHandle, f: impl FnOnce() -> T) -> T {
+    CURRENT.sync_scope(handle.0, f)
+}
+
 #[cfg(all(test, feature = "tokio"))]
 mod tests {
     use super::*;
@@ -250,5 +284,93 @@ mod tests {
             assert_eq!(o.context.lock().unwrap().get("who"), Some(&json!("sync")));
         });
         assert!(current_overlay().is_none(), "restored on exit");
+    }
+
+    #[tokio::test]
+    async fn test_a_captured_scope_survives_tokio_spawn() {
+        let seen = crate::scope::scope(async {
+            let o = current_overlay().unwrap();
+            set(&o.context, "who", json!("parent"));
+            let handle = crate::scope::current_scope();
+            tokio::spawn(crate::scope::in_scope(handle, async {
+                current_overlay()
+                    .unwrap()
+                    .context
+                    .lock()
+                    .unwrap()
+                    .get("who")
+                    .cloned()
+            }))
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(seen, Some(json!("parent")));
+    }
+
+    #[tokio::test]
+    async fn test_a_captured_scope_survives_spawn_blocking() {
+        // spawn_blocking is the common case: synchronous database drivers run
+        // there, and "query ran" is the canonical breadcrumb.
+        let seen = crate::scope::scope(async {
+            let o = current_overlay().unwrap();
+            set(&o.context, "who", json!("parent"));
+            let handle = crate::scope::current_scope();
+            tokio::task::spawn_blocking(move || {
+                crate::scope::in_scope_sync(handle, || {
+                    current_overlay()
+                        .unwrap()
+                        .context
+                        .lock()
+                        .unwrap()
+                        .get("who")
+                        .cloned()
+                })
+            })
+            .await
+            .unwrap()
+        })
+        .await;
+        assert_eq!(seen, Some(json!("parent")));
+    }
+
+    #[tokio::test]
+    async fn test_a_captured_scope_writes_back_to_the_same_overlay() {
+        // The handle shares the overlay rather than copying it, so a crumb
+        // recorded in a spawned task reaches the parent request's notice.
+        crate::scope::scope(async {
+            let handle = crate::scope::current_scope();
+            tokio::spawn(crate::scope::in_scope(handle, async {
+                current_overlay()
+                    .unwrap()
+                    .breadcrumbs
+                    .lock()
+                    .unwrap()
+                    .push(crate::breadcrumbs::Breadcrumb::new("child", "custom", None));
+            }))
+            .await
+            .unwrap();
+            let crumbs = current_overlay()
+                .unwrap()
+                .breadcrumbs
+                .lock()
+                .unwrap()
+                .snapshot();
+            assert_eq!(crumbs.len(), 1);
+            assert_eq!(crumbs[0].message, "child");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_capturing_outside_a_scope_yields_a_usable_fresh_scope() {
+        // current_scope() must not panic or return an Option — an unscoped
+        // caller gets a new empty scope, so the API is total.
+        assert!(current_overlay().is_none());
+        let handle = crate::scope::current_scope();
+        crate::scope::in_scope(handle, async {
+            assert!(current_overlay().is_some());
+        })
+        .await;
     }
 }
