@@ -3,9 +3,10 @@ use serde_json::json;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
+    // `development` is in the default `exclude_envs`, so this runs the whole
+    // assembly pipeline against the null transport and sends nothing.
     let config = honeybadger::Config::builder()
         .env("development")
-        .exclude_envs(Vec::<String>::new())
         .api_key("example-key")
         .build()
         .expect("config");

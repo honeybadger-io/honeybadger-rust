@@ -127,6 +127,10 @@ walkthrough:
 cargo run --features tokio --example scoped_request
 ```
 
+The example runs in the `development` environment, which `exclude_envs` excludes from
+reporting by default, so it exercises the whole assembly pipeline against the null
+transport and sends nothing over the network.
+
 Configuration is env-var friendly: `HONEYBADGER_API_KEY`, `HONEYBADGER_ENV`,
 `HONEYBADGER_REVISION`, `HONEYBADGER_ROOT`, `HONEYBADGER_HOSTNAME`,
 `HONEYBADGER_ENDPOINT`, `HONEYBADGER_ENABLED`.
