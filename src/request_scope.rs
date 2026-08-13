@@ -249,18 +249,21 @@ impl ScopeHandle {
     ///
     /// Total by design: an unscoped caller gets a usable handle rather than an
     /// `Option` to unwrap on a path that is often error handling already. **The
-    /// cost is that such a handle is a write sink.** A handle captured when no
-    /// scope was active — or captured inside a scope and re-entered after that
-    /// scope has exited — collects context and breadcrumbs into state nothing
-    /// will ever read, so they are silently discarded rather than reported. Note
-    /// that this is a change in failure mode: without a scope anywhere, an
-    /// `add_breadcrumb` from a `spawn_blocking` child landed in the process-wide
-    /// trail, which the parent's notice then read, so it *did* arrive. Capture
-    /// inside the scope whose state you want, and use the handle while that
-    /// scope is still running.
+    /// cost is that such a handle is detached.** A handle captured when no scope
+    /// was active — or captured inside a scope and re-entered after that scope
+    /// has exited — carries an overlay of its own. Context and breadcrumbs
+    /// recorded through it are visible for exactly as long as the handle is
+    /// entered: a notice or event reported *inside* that work does carry them.
+    /// What they never reach is the request that spawned the work, which is
+    /// reading a different overlay, so anything the child recorded is missing
+    /// from the parent's notices. Note that this is a change in failure mode:
+    /// without a scope anywhere, an `add_breadcrumb` from a `spawn_blocking`
+    /// child landed in the process-wide trail, which the parent's notice then
+    /// read, so it *did* arrive. Capture inside the scope whose state you want,
+    /// and use the handle while that scope is still running.
     ///
     /// Use [`try_current`](Self::try_current) where you would rather detect that
-    /// case than write into a sink.
+    /// case than record into an overlay the surrounding request cannot see.
     pub fn current() -> ScopeHandle {
         ScopeHandle(match current_overlay() {
             Some(overlay) => overlay,
@@ -273,10 +276,11 @@ impl ScopeHandle {
     /// The fallible counterpart to [`current`](Self::current), which is total and
     /// hands back a fresh empty scope instead. Prefer this one when "no scope
     /// here" is a condition worth acting on rather than papering over: a handle
-    /// captured outside a scope is a write sink, and whatever the spawned work
-    /// records through it is silently discarded. Reach for it in library or
-    /// middleware code that can fall back to putting the data on the notice, log
-    /// a warning, or assert during development that the request really was
+    /// captured outside a scope carries an overlay of its own, so what the
+    /// spawned work records through it stays with that work and never reaches
+    /// the notices reported by the code that spawned it. Reach for it in library
+    /// or middleware code that can fall back to putting the data on the notice,
+    /// log a warning, or assert during development that the request really was
     /// wrapped in [`scope`].
     ///
     /// Prefer [`current`](Self::current) in application code that is inside a
@@ -549,16 +553,26 @@ mod tests {
         let handle = ScopeHandle::current();
         handle
             .enter(async {
-                assert!(current_overlay().is_some());
+                let o = current_overlay().expect("the detached overlay is installed");
+                // And it is readable while entered — a notice reported in here
+                // does carry what was recorded through the handle. What no
+                // notice outside this work sees is the same state, because
+                // outside there is no overlay to read it from.
+                set(&o.context, "who", json!("detached"));
+                assert_eq!(
+                    o.context.lock().unwrap().get("who"),
+                    Some(&json!("detached"))
+                );
             })
             .await;
+        assert!(current_overlay().is_none(), "and it is gone again on exit");
     }
 
     #[tokio::test]
     async fn test_try_current_reports_whether_a_scope_is_active() {
         // The detectable counterpart to current(): outside a scope there is
-        // nothing to capture, and a caller that would otherwise write into a
-        // sink can see that.
+        // nothing to capture, and a caller that would otherwise record into a
+        // detached overlay its own request cannot read can see that.
         assert!(ScopeHandle::try_current().is_none());
         scope(async {
             assert!(ScopeHandle::try_current().is_some());
