@@ -871,30 +871,66 @@ mod tests {
     #[cfg(feature = "tokio")]
     #[tokio::test]
     async fn test_clear_context_does_not_erase_global_context_while_scoped() {
-        // The stated safety property: a request clearing its own context
-        // cannot erase the application's process-wide context.
+        // The stated safety property, for all four sub-stores clear_context
+        // touches: a request clearing its own context/breadcrumbs/
+        // event_context/request_id cannot erase the application's
+        // process-wide versions of any of them. A leak confined to just one
+        // of the three non-context stores must fail this test.
         let transport = Arc::new(TestTransport::new());
         let client = test_client(transport.clone());
         client.context([("global_key", json!("g"))]);
+        client.add_breadcrumb("global-crumb", "custom", None);
+        client.event_context([("global_event_key", json!("ge"))]);
+        client.request_id("req-global");
 
         crate::scope::scope(async {
             client.context([("scoped_key", json!("s"))]);
+            client.add_breadcrumb("scoped-crumb", "custom", None);
+            client.event_context([("scoped_event_key", json!("se"))]);
+            client.request_id("req-scoped");
             client.clear_context();
         })
         .await;
 
         client.notify_notice(crate::Notice::message("Boom", "x"));
+        client.event("after.scope", json!({}));
         assert!(client.flush(Duration::from_secs(5)));
-        let ctx = &delivered(&transport)[0]["request"]["context"];
+
+        let notice = &delivered(&transport)[0];
+        let ctx = &notice["request"]["context"];
         assert_eq!(
             ctx["global_key"],
             json!("g"),
-            "clear_context inside a scope must not touch the global base"
+            "clear_context inside a scope must not touch the global context"
         );
         assert!(
             ctx.get("scoped_key").is_none(),
             "the scope's own context was cleared"
         );
+
+        let crumbs = notice["breadcrumbs"]["trail"].as_array().unwrap();
+        assert_eq!(
+            crumbs.len(),
+            1,
+            "the global breadcrumb trail must survive a scoped clear_context"
+        );
+        assert_eq!(crumbs[0]["message"], json!("global-crumb"));
+
+        assert_eq!(
+            notice["correlation_context"]["request_id"],
+            json!("req-global"),
+            "the global request_id must survive a scoped clear_context"
+        );
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            events[0]["global_event_key"],
+            json!("ge"),
+            "the global event_context must survive a scoped clear_context"
+        );
+        assert!(events[0].get("scoped_event_key").is_none());
+
         client.shutdown(Duration::from_secs(5));
     }
 
@@ -996,6 +1032,41 @@ mod tests {
         assert!(
             events[1].get("request_id").is_none(),
             "the scoped request_id must not have leaked into the global slot"
+        );
+        client.shutdown(Duration::from_secs(5));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[tokio::test]
+    async fn test_clear_event_context_does_not_erase_the_global_while_scoped() {
+        // clear_event_context() had zero coverage: neither its overlay-vs-global
+        // routing nor the safety property (a scoped clear must not erase the
+        // global) was exercised anywhere in the suite.
+        let transport = Arc::new(TestTransport::new());
+        let client = test_client(transport.clone());
+        client.event_context([("global_key", json!("g"))]);
+
+        crate::scope::scope(async {
+            client.event_context([("overlay_key", json!("o"))]);
+            client.clear_event_context();
+            client.event("scoped.event", json!({}));
+            assert!(client.flush(Duration::from_secs(5)));
+        })
+        .await;
+
+        client.event("unscoped.event", json!({}));
+        assert!(client.flush(Duration::from_secs(5)));
+
+        let events = events_delivered(&transport);
+        assert_eq!(events.len(), 2);
+        assert!(
+            events[0].get("overlay_key").is_none(),
+            "the scoped clear_event_context must have cleared the overlay's own entry"
+        );
+        assert_eq!(
+            events[1]["global_key"],
+            json!("g"),
+            "a scoped clear_event_context must not erase the global event context"
         );
         client.shutdown(Duration::from_secs(5));
     }
