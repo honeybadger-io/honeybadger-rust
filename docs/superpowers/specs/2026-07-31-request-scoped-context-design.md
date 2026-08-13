@@ -297,13 +297,15 @@ not propagate" is what the first draft got wrong.
 
 ## Commit sequence
 
+This records the sequence as planned and executed, so it names the API as it
+stood at each step; the surface was reshaped afterwards, per decision 5.
+
 1. Extract `Scope` and route the 12 access points through the read/write helpers,
    with only the global implementation. No behaviour change, no new dependency;
    the existing suite is the proof.
-2. Add the `tokio` feature, the task-local overlay, `scope()` / `scope_sync()`,
+2. Add the `tokio` feature, the task-local overlay, `scope()` / `sync_scope()`,
    merge semantics, and the concurrency and contamination tests.
-3. Add `ScopeHandle` with `current` / `try_current` / `enter` / `enter_sync` and
-   their tests.
+3. Add `current_scope` / `in_scope` / `in_scope_sync` and their tests.
 4. Rewrite the hazard documentation and add the CI feature matrix.
 
 ## Out of scope
