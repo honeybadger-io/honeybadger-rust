@@ -33,6 +33,7 @@ jobs:
           components: clippy, rustfmt
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo clippy --all-targets --features tokio -- -D warnings
       - run: cargo doc --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
@@ -54,6 +55,9 @@ jobs:
       # The panic-hook tests spawn fixture processes via nested `cargo run`, so this
       # job compiles the crate three times over; it is slower than it looks.
       - run: cargo test
+      # The default build must never gain a dependency or lose behaviour.
+      - run: cargo test --no-default-features
+      - run: cargo test --features tokio
 
   msrv:
     runs-on: ubuntu-latest

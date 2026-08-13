@@ -36,3 +36,10 @@ mockito = "1"
 # which the concurrency test in step 8 uses — without it that attribute fails
 # to compile.
 tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-thread", "macros"] }
+
+# scoped_request calls honeybadger::scope, which does not exist without the
+# `tokio` feature. Without this stanza, `cargo build --examples` on the default
+# (no-feature) build would try and fail to compile it.
+[[example]]
+name = "scoped_request"
+required-features = ["tokio"]

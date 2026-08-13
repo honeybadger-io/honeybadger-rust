@@ -252,11 +252,13 @@ impl Client {
     /// Merges key/value pairs into this client's context, attached to every later
     /// notice. Setting a key to [`serde_json::Value::Null`] removes it.
     ///
-    /// **Shared by every thread and task using this client — it is not request-scoped.**
-    /// Concurrent requests overwrite each other here, which can attribute one user's
-    /// error to another. Use it for process-wide facts; put request data on the notice
-    /// via [`Notice::context`], which travels with the notice and cannot be clobbered.
-    /// See [the crate docs](crate#context-is-process-wide).
+    /// **Without an active scope, this is shared by every thread and task using this
+    /// client — it is not request-scoped.** Concurrent requests overwrite each other
+    /// here, which can attribute one user's error to another. Use it for process-wide
+    /// facts; put request data on the notice via [`Notice::context`], which travels
+    /// with the notice and cannot be clobbered. Inside `scope()` (requires the `tokio`
+    /// feature) this call writes to that request's own context instead — see
+    /// [the crate docs](crate#context-is-process-wide).
     ///
     /// Notice-local context wins on key collisions.
     pub fn context<I, K>(&self, entries: I)
@@ -283,10 +285,13 @@ impl Client {
     /// Clears this client's context, its breadcrumb trail, its event context, and its
     /// request id — the whole accumulated diagnostic scope.
     ///
-    /// The scope is shared process-wide, so this discards what every other in-flight
-    /// caller has accumulated too. It suits programs that handle one unit of work at a
-    /// time (a CLI, a cron job, a serialized queue consumer); calling it from a
-    /// concurrent request handler will erase other requests' state.
+    /// Without an active scope, this state is shared process-wide, so this discards
+    /// what every other in-flight caller has accumulated too. It suits programs that
+    /// handle one unit of work at a time (a CLI, a cron job, a serialized queue
+    /// consumer); calling it from a concurrent request handler will erase other
+    /// requests' state. Inside `scope()` (requires the `tokio` feature) this clears
+    /// only that request's own scope, leaving every other request's state — and the
+    /// process-wide base — untouched.
     pub fn clear_context(&self) {
         match self.overlay() {
             Some(o) => {
@@ -320,9 +325,10 @@ impl Client {
     /// Records a breadcrumb. The most recent 40 are attached to each notice; older ones
     /// fall off. A no-op when breadcrumbs are disabled in the config.
     ///
-    /// The trail is shared process-wide, not per request: under concurrency, crumbs from
-    /// unrelated requests interleave and evict one another. Treat it as a process-level
-    /// log rather than a request timeline.
+    /// Without an active scope the trail is process-wide, and under concurrency
+    /// crumbs from unrelated requests interleave and evict one another — treat it
+    /// as a process-level log. Inside `scope()` (requires the `tokio` feature) the
+    /// trail belongs to that request alone.
     pub fn add_breadcrumb(
         &self,
         message: &str,
@@ -502,10 +508,12 @@ impl Client {
     /// Merges key/value pairs into this client's **event** context, attached to
     /// every later event. Setting a key to [`serde_json::Value::Null`] removes it.
     ///
-    /// **Shared by every thread and task using this client — it is not
-    /// request-scoped.** Concurrent requests overwrite each other here. Use it
-    /// for process-wide facts and put per-request data in the event payload,
-    /// where it travels with the event and cannot be clobbered.
+    /// **Without an active scope, this is shared by every thread and task using
+    /// this client — it is not request-scoped.** Concurrent requests overwrite
+    /// each other here. Use it for process-wide facts and put per-request data
+    /// in the event payload, where it travels with the event and cannot be
+    /// clobbered. Inside `scope()` (requires the `tokio` feature) this call
+    /// writes to that request's own event context instead.
     pub fn event_context<I, K>(&self, entries: I)
     where
         I: IntoIterator<Item = (K, Value)>,
@@ -541,12 +549,15 @@ impl Client {
     /// driving deterministic sampling — every event sharing an id shares one
     /// sampling decision.
     ///
-    /// **This slot is process-wide, exactly like [`Client::context`].** The name
-    /// describes what you put in it, not a scoping guarantee. Under concurrency
-    /// one request's id overwrites another's, so an event can be attributed
-    /// *and sampled* as the wrong request. Use it in programs that handle one
-    /// unit of work at a time — a CLI, a cron job, a serialized consumer — and
-    /// in a concurrent server put `request_id` in the event payload instead.
+    /// **Without an active scope, this slot is process-wide, exactly like
+    /// [`Client::context`].** The name describes what you put in it, not a
+    /// scoping guarantee: under concurrency one request's id overwrites
+    /// another's, so an event can be attributed *and sampled* as the wrong
+    /// request. Use it in programs that handle one unit of work at a time — a
+    /// CLI, a cron job, a serialized consumer — and in a concurrent server
+    /// either wrap the request in `scope()` (requires the `tokio` feature),
+    /// which gives this call its own request-local slot, or, without the
+    /// feature, put `request_id` in the event payload instead.
     pub fn request_id(&self, id: impl Into<String>) {
         let overlay = self.overlay();
         let store = match &overlay {

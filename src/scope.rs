@@ -123,6 +123,15 @@ pub(crate) fn merged_context(
 /// `tokio::spawn`, `tokio::task::spawn_blocking`, and `std::thread::spawn` all
 /// start with no scope and fall back to process-global state. Carry it across
 /// explicitly with [`crate::current_scope`] and [`crate::in_scope`].
+///
+/// A `spawn` performed *inside a dependency* cannot be wrapped by the caller,
+/// so those notices fall back to process-global state too. There is no
+/// workaround short of the dependency cooperating.
+///
+/// NOTE: this module is private, so this doc comment is not rendered. The
+/// canonical, rendered copy of this caveat lives on `global::scope` in
+/// `src/global.rs`, since `pub use`-reexported wrappers are what rustdoc
+/// actually shows callers.
 #[cfg(feature = "tokio")]
 pub async fn scope<F: Future>(f: F) -> F::Output {
     CURRENT

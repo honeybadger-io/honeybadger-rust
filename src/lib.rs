@@ -30,9 +30,10 @@
 //!
 //! # Context is process-wide
 //!
-//! **[`context`] and [`add_breadcrumb`] write to one store shared by the whole process.
-//! They are not request-scoped, and not thread- or task-local.** In a concurrent server
-//! this is a data-attribution hazard:
+//! **[`context`] and [`add_breadcrumb`] write to one store shared by the whole
+//! process, unless a request scope is active. Without one, they are not
+//! request-scoped, and not thread- or task-local.** In a concurrent server this is
+//! a data-attribution hazard:
 //!
 //! ```text
 //! request A:  context([("user_id", 1)])
@@ -43,11 +44,13 @@
 //! Either request calling [`clear_context`] also wipes the other's state. Attaching one
 //! user's data to another user's error is a privacy problem, not just a confusing graph.
 //!
-//! Use the global functions only for data that is genuinely process-wide (release
-//! channel, region, worker identity) or for programs that handle one unit of work at a
-//! time — a CLI, a cron job, a single-threaded consumer.
+//! Without a scope, use the global functions only for data that is genuinely
+//! process-wide (release channel, region, worker identity) or for programs that
+//! handle one unit of work at a time — a CLI, a cron job, a single-threaded
+//! consumer.
 //!
-//! **For anything belonging to a request, put it on the notice:**
+//! **For anything belonging to a request, either enter a scope (below) or put it on
+//! the notice:**
 //!
 //! ```rust,no_run
 //! # fn handle(err: &std::io::Error, user_id: u64, request_id: &str) {
@@ -64,9 +67,32 @@
 //! cannot be overwritten by a concurrent request. Where both are set, notice-local keys
 //! win over the process-wide ones.
 //!
-//! Automatic per-request scoping — where `context()` resolves to the current request
-//! rather than the process — arrives with the planned `tracing` layer and tower/axum
-//! middleware. Until then, the rule above is the whole story.
+//! ## Request-scoped context with `scope()`
+//!
+//! With the `tokio` feature enabled, `scope()` gives [`context`], [`add_breadcrumb`],
+//! [`event_context`], and [`request_id`] a per-request home instead of the
+//! process-wide one described above:
+//!
+//! ```rust,no_run
+//! # #[cfg(feature = "tokio")]
+//! # async fn handler() {
+//! honeybadger::scope(async {
+//!     honeybadger::request_id("req-42");
+//!     honeybadger::context([("user_id", serde_json::json!(7))]);
+//!     // ... handle the request; notices and events reported in here carry only
+//!     // this request's data ...
+//! })
+//! .await;
+//! # }
+//! ```
+//!
+//! Two requests running concurrently, each in its own `scope()`, never see each
+//! other's values — the hazard above does not apply inside one. The scope does not,
+//! however, cross a `tokio::spawn`, `spawn_blocking`, or `std::thread::spawn`
+//! boundary on its own; see `scope()`'s own documentation (built with `--features
+//! tokio`) for how to carry it across explicitly with `current_scope()` and
+//! `in_scope`/`in_scope_sync`, and `examples/scoped_request.rs` for a complete,
+//! runnable walkthrough.
 //!
 //! # Insights events
 //!

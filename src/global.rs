@@ -85,13 +85,15 @@ pub fn notify_notice(notice: Notice) {
     with_client(|c| c.notify_notice(notice));
 }
 
-/// Merges key/value pairs into the **process-wide** context attached to every later
-/// notice. A no-op before [`init`].
+/// Merges key/value pairs into the context attached to every later notice. A no-op
+/// before [`init`].
 ///
-/// This store is shared by every thread and every task; it is not request-scoped. In a
-/// concurrent server, one request's values overwrite another's, and a notice can be
-/// reported against the wrong user. Use it only for process-wide facts, and put
-/// request data on the notice instead — see [the crate docs](crate#context-is-process-wide).
+/// **Without an active scope, this store is shared by every thread and every task; it
+/// is not request-scoped.** In a concurrent server, one request's values overwrite
+/// another's, and a notice can be reported against the wrong user. Use it only for
+/// process-wide facts, and put request data on the notice instead — see
+/// [the crate docs](crate#context-is-process-wide). Inside `scope()` (requires the
+/// `tokio` feature) this call writes to that request's own context instead.
 ///
 /// Setting a key to [`serde_json::Value::Null`] removes it.
 pub fn context<I, K>(entries: I)
@@ -102,21 +104,26 @@ where
     with_client(|c| c.context(entries));
 }
 
-/// Clears the **process-wide** context and breadcrumb trail. A no-op before [`init`].
+/// Clears the context, breadcrumb trail, event context, and request id. A no-op
+/// before [`init`].
 ///
-/// This resets state shared by the entire process, not the calling thread's or task's.
-/// Calling it from a request handler discards whatever every other in-flight request
-/// has accumulated, so it belongs between units of work in a program that handles one
-/// at a time — not in a concurrent server.
+/// **Without an active scope, this resets state shared by the entire process, not
+/// the calling thread's or task's.** Calling it from a request handler discards
+/// whatever every other in-flight request has accumulated, so it belongs between
+/// units of work in a program that handles one at a time — not in a concurrent
+/// server. Inside `scope()` (requires the `tokio` feature) this clears only that
+/// request's own scope, leaving every other request's state — and the process-wide
+/// base — untouched.
 pub fn clear_context() {
     with_client(|c| c.clear_context());
 }
 
-/// Records a breadcrumb in the **process-wide** trail. A no-op before [`init`].
+/// Records a breadcrumb in the trail. A no-op before [`init`].
 ///
-/// Like [`context`], the trail is shared process-wide rather than per request: under
-/// concurrency the crumbs of unrelated requests interleave, and the 40-entry buffer
-/// evicts across all of them. Treat it as a process-level log, not a request timeline.
+/// Without an active scope the trail is process-wide, and under concurrency
+/// crumbs from unrelated requests interleave and evict one another — treat it
+/// as a process-level log. Inside `scope()` (requires the `tokio` feature) the
+/// trail belongs to that request alone.
 pub fn add_breadcrumb(message: &str, category: &str, metadata: Option<Map<String, Value>>) {
     with_client(|c| c.add_breadcrumb(message, category, metadata));
 }
@@ -140,12 +147,14 @@ pub fn event_value(payload: Value) {
     with_client(|c| c.event_value(payload));
 }
 
-/// Merges key/value pairs into the **process-wide** event context attached to
-/// every later event. A no-op before [`init`].
+/// Merges key/value pairs into the event context attached to every later event.
+/// A no-op before [`init`].
 ///
-/// Like [`context`], this store is shared by the whole process and is not
-/// request-scoped; see [the crate docs](crate#context-is-process-wide). Setting
-/// a key to [`serde_json::Value::Null`] removes it.
+/// **Without an active scope, this store is shared by the whole process and is
+/// not request-scoped, exactly like [`context`];** see
+/// [the crate docs](crate#context-is-process-wide). Inside `scope()` (requires
+/// the `tokio` feature) this call writes to that request's own event context
+/// instead. Setting a key to [`serde_json::Value::Null`] removes it.
 pub fn event_context<I, K>(entries: I)
 where
     I: IntoIterator<Item = (K, Value)>,
@@ -160,13 +169,15 @@ pub fn clear_event_context() {
     with_client(|c| c.clear_event_context());
 }
 
-/// Sets the **process-wide** request id correlating notices with events and
-/// driving deterministic sampling. A no-op before [`init`].
+/// Sets the request id correlating notices with events and driving deterministic
+/// sampling. A no-op before [`init`].
 ///
-/// This slot carries the same hazard as [`context`]: under concurrency one
-/// request's id overwrites another's, so an event can be attributed and sampled
-/// as the wrong request. In a concurrent server put `request_id` in the event
-/// payload instead. See [`crate::Client::request_id`].
+/// **Without an active scope, this slot carries the same hazard as [`context`]:**
+/// under concurrency one request's id overwrites another's, so an event can be
+/// attributed and sampled as the wrong request. In a concurrent server either
+/// wrap the request in `scope()` (requires the `tokio` feature), which gives
+/// this call its own request-local slot, or, without the feature, put
+/// `request_id` in the event payload instead. See [`crate::Client::request_id`].
 pub fn request_id(id: impl Into<String>) {
     with_client(|c| c.request_id(id));
 }
@@ -184,6 +195,41 @@ pub fn flush(timeout: Duration) -> bool {
 
 /// Runs `f` with a fresh request scope. See [`crate::Client::context`] for what
 /// becomes request-local. Requires the `tokio` feature.
+///
+/// # The scope does not cross a thread or task boundary
+///
+/// It lives in a task-local that is only visible for the duration of `f`'s own
+/// poll. [`tokio::spawn`], [`tokio::task::spawn_blocking`], and
+/// [`std::thread::spawn`] all start their work with **no scope active**, so
+/// anything it records — [`crate::context`], [`crate::add_breadcrumb`],
+/// [`crate::event_context`], [`crate::request_id`] — falls back to the
+/// process-wide store documented on those functions, exactly as if `scope()`
+/// had never been entered.
+///
+/// Carry the scope across explicitly by capturing it with
+/// [`crate::current_scope`] and re-entering it with [`crate::in_scope`] (async)
+/// or [`crate::in_scope_sync`] (a `spawn_blocking` closure or a
+/// `std::thread::spawn` body):
+///
+/// ```rust,no_run
+/// # #[cfg(feature = "tokio")]
+/// # async fn handler() {
+/// let scope = honeybadger::current_scope();
+/// tokio::task::spawn_blocking(move || {
+///     honeybadger::in_scope_sync(scope, || {
+///         // a synchronous database driver, still recorded against this request:
+///         honeybadger::add_breadcrumb("query ran", "query", None);
+///     })
+/// })
+/// .await
+/// .unwrap();
+/// # }
+/// ```
+///
+/// **One hole no API closes:** a `spawn` performed *inside a third-party
+/// dependency* cannot be wrapped by you, so those notices fall back to
+/// process-global state. There is no workaround short of the dependency
+/// cooperating.
 #[cfg(feature = "tokio")]
 pub async fn scope<F: std::future::Future>(f: F) -> F::Output {
     crate::scope::scope(f).await
