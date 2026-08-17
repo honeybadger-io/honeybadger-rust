@@ -195,6 +195,7 @@ fn build_agent(connect: Duration, total: Duration) -> ureq::Agent {
         .timeout_connect(Some(connect))
         .timeout_global(Some(total))
         .http_status_as_error(false) // every status returns Ok(response)
+        .max_redirects(0)
         .build()
         .new_agent()
 }
@@ -403,6 +404,61 @@ mod tests {
             .status;
         assert_eq!(status, 201);
         mock.assert();
+    }
+
+    #[test]
+    fn test_server_transport_does_not_follow_redirects() {
+        for urgent in [false, true] {
+            for status in [301u16, 302, 303, 307, 308] {
+                let mut origin = mockito::Server::new();
+                let mut destination = mockito::Server::new();
+                let observed = std::sync::Arc::new(Mutex::new(Vec::new()));
+                let observed_by_get = std::sync::Arc::clone(&observed);
+                let redirect = origin
+                    .mock("POST", "/v1/notices")
+                    .with_status(usize::from(status))
+                    .with_header("Location", &format!("{}/stolen", destination.url()))
+                    .create();
+                let forwarded_get = destination
+                    .mock("GET", "/stolen")
+                    .match_body(mockito::Matcher::Any)
+                    .match_request(move |request| {
+                        observed_by_get.lock().unwrap().push((
+                            request.method().to_owned(),
+                            request
+                                .header("X-API-Key")
+                                .first()
+                                .and_then(|value| value.to_str().ok())
+                                .map(str::to_owned),
+                            request.body().unwrap().clone(),
+                        ));
+                        true
+                    })
+                    .with_status(201)
+                    .expect(0)
+                    .create();
+                let forwarded_post = destination
+                    .mock("POST", "/stolen")
+                    .match_body(mockito::Matcher::Any)
+                    .with_status(201)
+                    .expect(0)
+                    .create();
+
+                let t = ServerTransport::new(
+                    origin.url(),
+                    "test-key".into(),
+                    Duration::from_secs(2),
+                    Duration::from_secs(5),
+                );
+                let result = t.deliver(&TransportRequest::notices(&compress(b"{}"), urgent));
+
+                assert_eq!(result.unwrap().status, status);
+                assert!(observed.lock().unwrap().is_empty());
+                forwarded_get.assert();
+                forwarded_post.assert();
+                redirect.assert();
+            }
+        }
     }
 
     #[test]
