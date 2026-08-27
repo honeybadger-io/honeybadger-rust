@@ -3,10 +3,13 @@ use flate2::Compression;
 use flate2::write::ZlibEncoder;
 use std::io::Write;
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub(crate) const NOTICES_PATH: &str = "/v1/notices";
 pub(crate) const EVENTS_PATH: &str = "/v1/events";
+
+const HONEYBADGER_DOMAIN: &str = "honeybadger.io";
+const HONEYBADGER_SUBDOMAIN_SUFFIX: &str = ".honeybadger.io";
 
 /// Which Honeybadger API a request targets.
 #[non_exhaustive]
@@ -190,13 +193,45 @@ fn urgent_budget(connect: Duration, request: Duration) -> (Duration, Duration) {
 /// Ceiling on how long a panic may hang waiting for its notice to land.
 const URGENT_MAX_TOTAL: Duration = Duration::from_secs(5);
 
+fn is_honeybadger_host(host: &str) -> bool {
+    host == HONEYBADGER_DOMAIN || host.ends_with(HONEYBADGER_SUBDOMAIN_SUFFIX)
+}
+
+fn redirect_allowed(current: &url::Url, next: &url::Url) -> bool {
+    let (Some(current_host), Some(next_host)) = (current.host_str(), next.host_str()) else {
+        return false;
+    };
+
+    let same_origin = current.scheme() == next.scheme()
+        && current_host.eq_ignore_ascii_case(next_host)
+        && current.port_or_known_default() == next.port_or_known_default();
+    let honeybadger_host = next.scheme() == "https"
+        && next.port_or_known_default() == Some(443)
+        && is_honeybadger_host(next_host);
+    let no_credentials = next.username().is_empty() && next.password().is_none();
+
+    (same_origin || honeybadger_host) && no_credentials
+}
+
 fn build_agent(connect: Duration, total: Duration) -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_connect(Some(connect))
         .timeout_global(Some(total))
         .http_status_as_error(false) // every status returns Ok(response)
+        .max_redirects(0)
         .build()
         .new_agent()
+}
+
+fn add_headers<B>(
+    request: ureq::RequestBuilder<B>,
+    api_key: &str,
+    user_agent: &str,
+) -> ureq::RequestBuilder<B> {
+    request
+        .header("X-API-Key", api_key)
+        .header("Accept", "application/json")
+        .header("User-Agent", user_agent)
 }
 
 impl ServerTransport {
@@ -206,14 +241,12 @@ impl ServerTransport {
         connect: Duration,
         request: Duration,
     ) -> Self {
+        let (urgent_connect, urgent_total) = urgent_budget(connect, request);
         ServerTransport {
             endpoint: endpoint.trim_end_matches('/').to_string(),
             api_key,
             agent: build_agent(connect, request),
-            urgent_agent: {
-                let (urgent_connect, urgent_total) = urgent_budget(connect, request);
-                build_agent(urgent_connect, urgent_total)
-            },
+            urgent_agent: build_agent(urgent_connect, urgent_total),
             user_agent: user_agent(),
         }
     }
@@ -221,29 +254,59 @@ impl ServerTransport {
 
 impl Transport for ServerTransport {
     fn deliver(&self, req: &TransportRequest) -> Result<TransportResponse, TransportError> {
-        let url = format!("{}{}", self.endpoint, req.path);
+        let url = url::Url::parse(&format!("{}{}", self.endpoint, req.path))
+            .map_err(|e| TransportError(format!("invalid transport URL: {e}")))?;
         let agent = if req.urgent {
             &self.urgent_agent
         } else {
             &self.agent
         };
-        agent
-            .post(&url)
-            .header("X-API-Key", &self.api_key)
+        let started = Instant::now();
+        let total = agent
+            .config()
+            .timeouts()
+            .global
+            .ok_or_else(|| TransportError("transport request has no deadline".into()))?;
+        add_headers(agent.post(url.as_str()), &self.api_key, &self.user_agent)
             .header("Content-Type", req.content_type)
-            .header("Accept", "application/json")
             .header("Content-Encoding", "deflate")
-            .header("User-Agent", &self.user_agent)
             .send(req.body)
-            .map(|resp| {
+            .map_err(|e| TransportError(e.to_string()))
+            .and_then(|response| match response.status().as_u16() {
+                301..=303 => match response
+                    .headers()
+                    .get("location")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|location| url.join(location).ok())
+                {
+                    Some(next_url) if redirect_allowed(&url, &next_url) => {
+                        let remaining = total.checked_sub(started.elapsed()).ok_or_else(|| {
+                            TransportError("transport request deadline exceeded".into())
+                        })?;
+                        add_headers(
+                            agent.get(next_url.as_str()),
+                            &self.api_key,
+                            &self.user_agent,
+                        )
+                        .config()
+                        .timeout_global(Some(remaining))
+                        .build()
+                        .call()
+                        .map_err(|e| TransportError(e.to_string()))
+                    }
+                    _ => Ok(response),
+                },
+                _ => Ok(response),
+            })
+            .map(|response| {
                 let retry_after = parse_retry_after(
-                    resp.headers()
+                    response
+                        .headers()
                         .get("retry-after")
                         .and_then(|v| v.to_str().ok()),
                 );
-                TransportResponse::new(resp.status().as_u16()).retry_after(retry_after)
+                TransportResponse::new(response.status().as_u16()).retry_after(retry_after)
             })
-            .map_err(|e| TransportError(e.to_string()))
     }
 }
 
@@ -403,6 +466,112 @@ mod tests {
             .status;
         assert_eq!(status, 201);
         mock.assert();
+    }
+
+    #[test]
+    fn test_server_transport_follows_allowed_same_origin_redirects() {
+        let mut server = mockito::Server::new();
+        let redirect = server
+            .mock("POST", "/v1/notices")
+            .with_status(303)
+            .with_header("Location", "/stolen")
+            .create();
+        let forwarded = server
+            .mock("GET", "/stolen")
+            .match_header("X-API-Key", "test-key")
+            .with_status(201)
+            .create();
+        let t = ServerTransport::new(
+            server.url(),
+            "test-key".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            t.deliver(&TransportRequest::notices(&compress(b"{}"), false))
+                .unwrap()
+                .status,
+            201
+        );
+        forwarded.assert();
+        redirect.assert();
+    }
+
+    #[test]
+    fn test_server_transport_rejects_cross_host_redirects() {
+        let mut origin = mockito::Server::new();
+        let mut destination = mockito::Server::new();
+        let destination_url = destination.url();
+        let origin_url = {
+            let mut url = url::Url::parse(&origin.url()).unwrap();
+            url.set_host(Some("localhost")).unwrap();
+            url.to_string()
+        };
+        let redirect = origin
+            .mock("POST", "/v1/notices")
+            .with_status(302)
+            .with_header("Location", &format!("{destination_url}/stolen"))
+            .create();
+        let forwarded = destination
+            .mock("GET", "/stolen")
+            .with_status(201)
+            .expect(0)
+            .create();
+
+        let t = ServerTransport::new(
+            origin_url,
+            "test-key".into(),
+            Duration::from_secs(2),
+            Duration::from_secs(5),
+        );
+        let result = t.deliver(&TransportRequest::notices(&compress(b"{}"), false));
+
+        assert_eq!(result.unwrap().status, 302);
+        forwarded.assert();
+        redirect.assert();
+    }
+
+    #[test]
+    fn test_redirect_policy() {
+        let url = |value| url::Url::parse(value).unwrap();
+
+        assert!(redirect_allowed(
+            &url("http://configured.example:8080"),
+            &url("http://configured.example:8080/path")
+        ));
+        assert!(!redirect_allowed(
+            &url("http://configured.example:8080"),
+            &url("http://configured.example:9000/path")
+        ));
+        assert!(redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("https://eu.honeybadger.io/v1/notices")
+        ));
+        assert!(redirect_allowed(
+            &url("http://honeybadger.io/v1/notices"),
+            &url("https://honeybadger.io/v1/notices")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("https://eu.honeybadger.io:8443/v1/notices")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("https://honeybadger.io.example.com/v1/notices")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("https://example.com/v1/notices")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("http://api.honeybadger.io/v1/notices")
+        ));
+        assert!(!redirect_allowed(
+            &url("https://api.honeybadger.io/v1/notices"),
+            &url("https://user:password@api.honeybadger.io/v1/notices")
+        ));
     }
 
     #[test]
