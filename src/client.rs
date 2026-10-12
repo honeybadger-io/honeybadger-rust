@@ -378,8 +378,8 @@ impl Client {
             Some(deadline) => rx.recv_deadline(deadline).unwrap_or(false),
             None => rx.recv().unwrap_or(false),
         };
-        let notices_ok = notices.map(&wait).unwrap_or(false);
-        let events_ok = events.map(&wait).unwrap_or(true);
+        let notices_ok = notices.map(wait).unwrap_or(false);
+        let events_ok = events.map(wait).unwrap_or(true);
         notices_ok && events_ok
     }
 
