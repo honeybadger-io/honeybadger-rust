@@ -21,7 +21,7 @@ backtrace = "0.3"
 crossbeam-channel = "0.5"
 flate2 = "1"
 hostname = "0.4"
-jiff = "0.2"
+jiff = "1.0"
 log = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
